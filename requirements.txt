@@ -1,0 +1,24 @@
+# Financial FP&A CrewAI - Enhanced Dependencies
+
+# Core CrewAI
+crewai[tools]>=0.86.0,<1.0.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# PDF Generation
+reportlab>=4.0.0
+pillow>=10.0.0
+
+# Web Interface
+streamlit>=1.28.0
+
+# Already included in crewai[tools]:
+# - SerperDevTool
+# - ScrapeWebsiteTool
+# - Other CrewAI tools

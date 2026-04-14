@@ -1,0 +1,188 @@
+performance_analysis_task:
+  description: >
+    Analyze the financial performance of the company using the provided dataset.
+    Use the FPA analysis tool to extract key metrics including:
+    - Revenue growth trends
+    - EBITDA margins and profitability
+    - Operating cash flow health
+    
+    Focus strictly on historical and current performance.
+    Provide clear, business-language explanations of what the numbers reveal.
+    
+    Dataset path: {csv_path}
+  expected_output: >
+    A detailed performance analysis report containing:
+    - Revenue growth analysis with trend interpretation
+    - Profitability metrics (EBITDA margin) with business context
+    - Cash flow health assessment
+    - Key insights on financial efficiency
+    Formatted as clear business narrative without technical jargon.
+  agent: fpa_analyst
+
+market_research_task:
+  description: >
+    Provide industry context and benchmark analysis to contextualize
+    the company's financial performance.
+    
+    Using your knowledge of financial industry standards and best practices:
+    - Estimate typical industry EBITDA margins for similar companies
+    - Provide context on typical revenue growth rates
+    - Discuss general market trends affecting financial performance
+    - Offer perspective on how the metrics compare to industry norms
+    
+    Note: Use your general knowledge and the LLM's understanding of
+    financial markets to provide context. Focus on providing valuable
+    comparative insights based on the data provided.
+  expected_output: >
+    A market context report containing:
+    - Industry benchmark estimates and comparisons
+    - General competitive positioning analysis
+    - Relevant market trends and economic context
+    - Assessment of performance relative to typical industry standards
+    Formatted as a concise market intelligence brief.
+  agent: market_researcher
+  context:
+    - performance_analysis_task
+
+scenario_planning_task:
+  description: >
+    Based on the performance analysis results, create forward-looking scenarios.
+    Use the FPA analysis tool to generate best-case, base-case, and worst-case scenarios.
+    
+    Your scenarios should be:
+    - Grounded in historical performance data
+    - Realistic and conservative
+    - Clearly differentiated by assumptions
+    
+    Consider asking the FPA Analyst for clarification on trends if needed.
+    
+    Dataset path: {csv_path}
+  expected_output: >
+    A scenario planning report with:
+    - Best-case scenario with revenue projections and assumptions
+    - Base-case scenario as the most likely outcome
+    - Worst-case scenario with downside risks
+    - Clear explanation of what drives each scenario
+    Formatted as executive summary suitable for leadership review.
+  agent: scenario_analyst
+  context:
+    - performance_analysis_task
+    - market_research_task
+
+risk_assessment_task:
+  description: >
+    Evaluate the financial stability and risk profile of the company.
+    Use the FPA analysis tool to assess:
+    - Liquidity position (current ratio)
+    - Leverage and debt sustainability (debt/equity ratio)
+    - Cash flow stability
+    
+    Be conservative in your assessment. Flag any warning signs.
+    You may ask the FPA Analyst or Market Researcher for additional context.
+    
+    Dataset path: {csv_path}
+  expected_output: >
+    A risk assessment report containing:
+    - Liquidity analysis with current ratio interpretation
+    - Leverage assessment with debt/equity analysis
+    - Cash sustainability evaluation
+    - Risk flags and recommendations for mitigation
+    Formatted as a risk briefing for CFO review.
+  agent: risk_analyst
+  context:
+    - performance_analysis_task
+    - market_research_task
+
+chart_generation_task:
+  description: >
+    Generate professional visual charts to illustrate financial insights.
+    
+    Use the chart generation tools to create:
+    1. Revenue trend chart - showing revenue over time with trend line
+    2. Scenario comparison chart - visualizing best/base/worst cases
+    3. Risk metrics dashboard - showing liquidity and leverage trends
+    4. Profitability analysis chart - EBITDA margin vs revenue
+    
+    All charts should be saved to the charts/ directory.
+    Ensure charts are professional, clear, and board-ready.
+    
+    Dataset path: {csv_path}
+  expected_output: >
+    Confirmation that all 4 charts have been generated successfully,
+    with file paths and brief description of insights visible in each chart.
+  agent: fpa_analyst
+  context:
+    - performance_analysis_task
+    - scenario_planning_task
+    - risk_assessment_task
+
+cfo_advisory_task:
+  description: >
+    Synthesize all previous analyses into a concise, executive-level summary.
+    
+    You will receive:
+    - Performance analysis from the FPA analyst
+    - Market context from the market researcher
+    - Scenario planning from the scenario analyst
+    - Risk assessment from the risk analyst
+    - Chart generation confirmation
+    
+    Your job is to:
+    - Integrate insights from all analyses
+    - Highlight the most critical findings
+    - Provide strategic recommendations
+    - Present in a board-ready format
+    
+    You may ask questions to any specialist for clarification.
+    Do NOT recalculate numbers. Focus on interpretation and strategic implications.
+  expected_output: >
+    An executive summary suitable for CFO and board presentation containing:
+    - Executive Overview (2-3 key takeaways)
+    - Performance Highlights (from FPA analyst)
+    - Market Position (from market researcher)
+    - Future Outlook (from scenario analyst)
+    - Risk Considerations (from risk analyst)
+    - Strategic Recommendations (3-5 actionable items)
+    
+    Formatted as a polished executive memo, maximum 2 pages equivalent.
+    Use clear headings, bullet points, and professional tone.
+  agent: cfo_advisor
+  context:
+    - performance_analysis_task
+    - market_research_task
+    - scenario_planning_task
+    - risk_assessment_task
+    - chart_generation_task
+
+pdf_generation_task:
+  description: >
+    Compile all analyses, insights, and charts into a comprehensive
+    PDF report suitable for board presentation.
+    
+    The PDF should include:
+    - Cover page with report date
+    - Table of contents
+    - Executive summary (from CFO Advisor)
+    - Performance analysis section with charts
+    - Market context section
+    - Scenario planning section with comparison chart
+    - Risk assessment section with dashboard
+    - Strategic recommendations
+    - Professional formatting throughout
+    
+    Use the PDF generation tool to create the report.
+    Ensure all charts from the charts/ directory are embedded.
+    
+    Dataset path: {csv_path}
+  expected_output: >
+    Confirmation that the PDF report has been generated successfully
+    at reports/fpa_analysis.pdf, with a summary of included sections.
+  agent: cfo_advisor
+  context:
+    - performance_analysis_task
+    - market_research_task
+    - scenario_planning_task
+    - risk_assessment_task
+    - chart_generation_task
+    - cfo_advisory_task
+  output_file: reports/fpa_analysis_summary.md
