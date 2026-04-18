@@ -37,8 +37,7 @@ def add_header_footer(canvas, doc):
     canvas.restoreState()
 
 
-@tool
-def generate_pdf_report(
+def build_pdf_report(
     performance_insights: str = "",
     market_insights: str = "",
     scenario_insights: str = "",
@@ -48,8 +47,10 @@ def generate_pdf_report(
     output_path: str = "reports/fpa_analysis.pdf"
 ):
     """
-    Generate comprehensive PDF report with all insights and charts.
-    
+    Plain Python function -- build and write the PDF report.
+    Called directly by flow.py (avoids CrewAI Tool wrapper TypeError).
+    The @tool wrapper below exposes the same logic to CrewAI agents.
+
     Args:
         performance_insights: Insights from FPA Analyst
         market_insights: Insights from Market Researcher
@@ -58,7 +59,7 @@ def generate_pdf_report(
         cfo_summary: Executive summary from CFO Advisor
         chart_dir: Directory containing generated charts
         output_path: Where to save the PDF
-        
+
     Returns:
         dict: PDF path and status
     """
@@ -291,3 +292,31 @@ def generate_pdf_report(
         "status": "success",
         "message": f"PDF report generated successfully at {output_path}"
     }
+
+# -- CrewAI Tool Wrapper -------------------------------------------------------
+# flow.py imports and calls build_pdf_report() directly (plain function above)
+# to avoid the "Tool object is not callable" error.
+# Agents call generate_pdf_report() through the @tool interface below.
+@tool
+def generate_pdf_report(
+    performance_insights: str = "",
+    market_insights: str = "",
+    scenario_insights: str = "",
+    risk_insights: str = "",
+    cfo_summary: str = "",
+    chart_dir: str = "charts",
+    output_path: str = "reports/fpa_analysis.pdf"
+):
+    """
+    Generate comprehensive PDF report with all insights and charts.
+    Thin @tool wrapper around build_pdf_report() for use by CrewAI agents.
+    """
+    return build_pdf_report(
+        performance_insights=performance_insights,
+        market_insights=market_insights,
+        scenario_insights=scenario_insights,
+        risk_insights=risk_insights,
+        cfo_summary=cfo_summary,
+        chart_dir=chart_dir,
+        output_path=output_path,
+    )

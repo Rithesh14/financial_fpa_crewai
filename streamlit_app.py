@@ -1,422 +1,718 @@
 """
-Financial FP&A Analysis - Streamlit Application
-Interactive web interface for enterprise financial analysis
+Financial FP&A Analysis — Streamlit Application v2.
+Powered by CrewAI Flows with typed state, real-time progress,
+and structured Pydantic outputs.
 """
 
 import streamlit as st
 import pandas as pd
 import os
 import sys
-from pathlib import Path
+import json
 import tempfile
-import shutil
+from pathlib import Path
 from datetime import datetime
 
-# Load environment variables from .env file
+# ── Path & env setup ───────────────────────────────────────────────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
 from dotenv import load_dotenv
 load_dotenv()
 
-# Force Ollama configuration if not already set
 if not os.getenv('OPENAI_API_BASE'):
-    os.environ['OPENAI_API_BASE'] = 'http://localhost:11434/v1'
+    os.environ['OPENAI_API_BASE'] = 'https://api.groq.com/openai/v1'
 if not os.getenv('OPENAI_MODEL_NAME'):
-    os.environ['OPENAI_MODEL_NAME'] = 'llama3.1'
-if not os.getenv('OPENAI_API_KEY'):
-    os.environ['OPENAI_API_KEY'] = 'NA'
+    os.environ['OPENAI_MODEL_NAME'] = 'meta-llama/llama-4-scout-17b-16e-instruct'
+if not os.getenv('OPENAI_API_KEY') and os.getenv('GROQ_API_KEY'):
+    os.environ['OPENAI_API_KEY'] = os.getenv('GROQ_API_KEY')
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
-
-from financial_fpa.crew import FinancialFpa
-
-# Page configuration
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Financial FP&A Analysis",
+    page_title="Financial FP&A Intelligence",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Define run_analysis function early so it can be called later
-def run_analysis(csv_path):
-    """Run the complete FP&A analysis pipeline"""
-    
-    # Create progress container
-    progress_container = st.container()
-    
-    with progress_container:
-        st.markdown("### 🔄 Analysis in Progress")
-        
-        # Progress bar
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Create directories
-        os.makedirs("charts", exist_ok=True)
-        os.makedirs("reports", exist_ok=True)
-        
-        try:
-            # Step 1: Initialize
-            status_text.text("Initializing AI agents...")
-            progress_bar.progress(10)
-            
-            # Prepare inputs
-            inputs = {'csv_path': csv_path}
-            
-            # Step 2: Run analysis
-            status_text.text("Running financial analysis (this may take a few minutes)...")
-            progress_bar.progress(20)
-            
-            # Execute crew
-            with st.spinner("AI agents are analyzing your data..."):
-                result = FinancialFpa().crew().kickoff(inputs=inputs)
-            
-            progress_bar.progress(90)
-            status_text.text("Finalizing report...")
-            
-            # Check for PDF
-            pdf_path = "reports/fpa_analysis.pdf"
-            if os.path.exists(pdf_path):
-                st.session_state.pdf_path = pdf_path
-            
-            # Mark as complete
-            st.session_state.analysis_complete = True
-            st.session_state.charts_generated = True
-            
-            progress_bar.progress(100)
-            status_text.text("✅ Analysis complete!")
-            
-            st.success("🎉 Analysis completed successfully! Check the 'Results & Charts' and 'Download Report' tabs.")
-            st.balloons()
-            
-        except Exception as e:
-            st.error(f"❌ Error during analysis: {str(e)}")
-            st.exception(e)
-            progress_bar.progress(0)
-
-# Custom CSS
+# ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
-    <style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #2E86AB;
-        text-align: center;
-        padding: 1rem 0;
-    }
-    .sub-header {
-        font-size: 1.2rem;
-        color: #666;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .success-box {
-        padding: 1rem;
-        background-color: #d4edda;
-        border-left: 5px solid #28a745;
-        margin: 1rem 0;
-    }
-    .info-box {
-        padding: 1rem;
-        background-color: #d1ecf1;
-        border-left: 5px solid #17a2b8;
-        margin: 1rem 0;
-    }
-    .warning-box {
-        padding: 1rem;
-        background-color: #fff3cd;
-        border-left: 5px solid #ffc107;
-        margin: 1rem 0;
-    }
-    </style>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+.main-header {
+    font-size: 2.4rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #2E86AB 0%, #A23B72 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-align: center;
+    padding: 1rem 0 0.3rem 0;
+    letter-spacing: -0.5px;
+}
+.sub-header {
+    font-size: 1rem;
+    color: #888;
+    text-align: center;
+    margin-bottom: 2rem;
+    font-weight: 400;
+}
+.metric-card {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border: 1px solid #2E86AB33;
+    border-radius: 12px;
+    padding: 1.2rem;
+    margin: 0.3rem 0;
+}
+.status-badge-success {
+    display: inline-block;
+    background: #06D6A022;
+    color: #06D6A0;
+    border: 1px solid #06D6A055;
+    border-radius: 20px;
+    padding: 0.2rem 0.8rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+}
+.status-badge-warning {
+    display: inline-block;
+    background: #FFB70322;
+    color: #FFB703;
+    border: 1px solid #FFB70355;
+    border-radius: 20px;
+    padding: 0.2rem 0.8rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+}
+.status-badge-error {
+    display: inline-block;
+    background: #EF476F22;
+    color: #EF476F;
+    border: 1px solid #EF476F55;
+    border-radius: 20px;
+    padding: 0.2rem 0.8rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+}
+.section-divider {
+    border: none;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, #2E86AB44, transparent);
+    margin: 1.5rem 0;
+}
+.risk-low      { color: #06D6A0; font-weight: 600; }
+.risk-moderate { color: #FFB703; font-weight: 600; }
+.risk-high     { color: #EF476F; font-weight: 600; }
+.risk-critical { color: #FF0000; font-weight: 700; animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+</style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
-if 'analysis_complete' not in st.session_state:
-    st.session_state.analysis_complete = False
-if 'charts_generated' not in st.session_state:
-    st.session_state.charts_generated = False
-if 'pdf_path' not in st.session_state:
-    st.session_state.pdf_path = None
-if 'uploaded_file_path' not in st.session_state:
-    st.session_state.uploaded_file_path = None
+# ── Session state init ────────────────────────────────────────────────────────
+defaults = {
+    'analysis_complete': False,
+    'flow_state':        None,
+    'uploaded_file_path': None,
+    'selected_company':  None,
+    'selected_sector':   None,
+    'run_history':       [],
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# Header
-st.markdown('<div class="main-header">📊 Financial FP&A Analysis</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Enterprise-Grade Financial Analysis with AI Agents</div>', unsafe_allow_html=True)
+# ── Header ────────────────────────────────────────────────────────────────────
+st.markdown('<div class="main-header">📊 Financial FP&A Intelligence</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Enterprise-Grade AI Financial Analysis · Powered by CrewAI Flows</div>', unsafe_allow_html=True)
 
-# Sidebar
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("🔧 Configuration")
-    
-    st.markdown("### Analysis Pipeline")
-    st.markdown("""
-    1. **Performance Analysis** - Historical metrics
-    2. **Market Research** - Industry benchmarks
-    3. **Scenario Planning** - Future projections
-    4. **Risk Assessment** - Financial stability
-    5. **Chart Generation** - Visual insights
-    6. **CFO Advisory** - Executive summary
-    7. **PDF Report** - Comprehensive output
-    """)
-    
-    st.markdown("---")
-    
-    st.markdown("### 🤖 AI Agents")
-    st.markdown("""
-    - FP&A Analyst
-    - Market Researcher
-    - Scenario Analyst
-    - Risk Analyst
-    - CFO Advisor
-    """)
-    
-    st.markdown("---")
-    
-    # API Key / LLM Configuration status
-    st.markdown("### 🤖 LLM Configuration")
-    
-    # Check for Ollama or OpenAI configuration
-    openai_base = os.getenv('OPENAI_API_BASE')
-    openai_key = os.getenv('OPENAI_API_KEY')
-    model_name = os.getenv('OPENAI_MODEL_NAME')
-    
-    if openai_base and 'localhost' in openai_base:
-        # Using Ollama
-        st.success("✅ Ollama (Local LLM)")
-        if model_name:
-            st.info(f"📦 Model: {model_name}")
-        else:
-            st.warning("⚠️ OPENAI_MODEL_NAME not set")
-    elif openai_key and openai_key != 'NA':
-        # Using OpenAI
-        st.success("✅ OpenAI API configured")
+    st.markdown("### ⚙️ Configuration")
+
+    # LLM Status
+    base_url   = os.getenv('OPENAI_API_BASE', '')
+    model_name = os.getenv('OPENAI_MODEL_NAME', '')
+    api_key    = os.getenv('OPENAI_API_KEY', '')
+
+    groq_key   = os.getenv('GROQ_API_KEY', '')
+
+    if 'groq.com' in base_url or groq_key:
+        display_model = model_name.replace('groq/', '')
+        st.success(f"✅ Groq · `{display_model}`")
+    elif 'localhost' in base_url:
+        st.success(f"✅ Ollama · `{model_name}`")
+    elif api_key and api_key != 'NA':
+        st.success("✅ OpenAI API")
     else:
         st.error("❌ LLM not configured")
-        st.markdown("Set up either Ollama or OpenAI in `.env`")
-    
+
     st.markdown("---")
-    st.markdown("### 🌐 Internet Search")
+    st.markdown("### 📋 Pipeline Steps")
+    pipeline_steps = [
+        "1. Input Validation (Flow)",
+        "2. Performance Analysis",
+        "3. Market Research",
+        "4. Scenario Planning",
+        "5. Risk Assessment",
+        "6. Chart Generation",
+        "7. CFO Advisory",
+        "8. PDF Report Generation",
+    ]
+    for step in pipeline_steps:
+        st.markdown(f"<small>{step}</small>", unsafe_allow_html=True)
 
-    if os.getenv('SERPER_API_KEY'):
-        st.success("✅ Serper API Key configured")
-    else:
-        st.warning("⚠️ Serper API Key missing (optional)")
+    st.markdown("---")
+    st.markdown("### 🤖 AI Agents")
+    agents = [
+        "🔍 FP&A Analyst",
+        "🌍 Market Researcher",
+        "📈 Scenario Analyst",
+        "⚠️ Risk Analyst",
+        "💼 CFO Advisor",
+    ]
+    for a in agents:
+        st.markdown(f"<small>{a}</small>", unsafe_allow_html=True)
 
-# Main content
-tab1, tab2, tab3 = st.tabs(["📤 Upload & Analyze", "📊 Results & Charts", "📄 Download Report"])
+    st.markdown("---")
+    # Quick run with default dataset
+    if st.button("⚡ Demo Run (AAPL)", use_container_width=True):
+        st.session_state.uploaded_file_path = os.path.abspath(
+            "src/data/modified_financial_data.csv"
+        )
+        st.session_state.selected_company = "AAPL"
+        st.session_state.selected_sector  = "IT"
+        st.rerun()
 
+# ── Main tabs ─────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📤 Upload & Configure", "📊 Results & Charts", "📋 Detailed Analysis", "📄 Download Report"]
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — Upload & Configure
+# ══════════════════════════════════════════════════════════════════════════════
 with tab1:
-    st.header("Upload Financial Data")
-    
-    st.markdown("""
-    <div class="info-box">
-    <strong>📋 Required CSV Format:</strong><br>
-    Your CSV should contain financial data with columns like: Period, Revenue, EBITDA, 
-    Operating_Cash_Flow, Debt/Equity Ratio, Current Ratio, etc.
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # File uploader
-    uploaded_file = st.file_uploader(
-        "Choose a CSV file",
-        type=['csv'],
-        help="Upload your financial data in CSV format"
-    )
-    
-    if uploaded_file is not None:
-        # Display file info
-        st.success(f"✅ File uploaded: {uploaded_file.name}")
-        
-        # Preview data
-        try:
-            df = pd.read_csv(uploaded_file)
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Rows", len(df))
-            with col2:
-                st.metric("Columns", len(df.columns))
-            with col3:
-                st.metric("Companies", df['Company'].nunique() if 'Company' in df.columns else 'N/A')
-            
-            with st.expander("📊 Preview Data (First 10 rows)"):
-                st.dataframe(df.head(10), use_container_width=True)
-            
-            with st.expander("📋 Column Information"):
-                st.write("**Available Columns:**")
-                st.write(", ".join(df.columns.tolist()))
-            
-            # Save uploaded file temporarily
-            temp_dir = tempfile.mkdtemp()
-            temp_file_path = os.path.join(temp_dir, "uploaded_data.csv")
-            df.to_csv(temp_file_path, index=False)
-            st.session_state.uploaded_file_path = temp_file_path
-            
-            st.markdown("---")
-            
-            # Analysis button
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                if st.button("🚀 Start Analysis", type="primary", use_container_width=True):
-                    run_analysis(temp_file_path)
-        
-        except Exception as e:
-            st.error(f"❌ Error reading CSV file: {str(e)}")
-    
-    else:
-        st.info("👆 Please upload a CSV file to begin analysis")
+    st.header("Financial Data Setup")
 
+    col_upload, col_config = st.columns([3, 2])
+
+    with col_upload:
+        st.markdown("#### 📂 Upload Financial CSV")
+
+        # Option A: Upload
+        uploaded = st.file_uploader(
+            "Choose CSV file",
+            type=['csv'],
+            help="Required columns: Period, Company, Revenue, EBITDA, Operating_Cash_Flow, Debt/Equity Ratio, Current Ratio"
+        )
+
+        # Option B: Use built-in demo data
+        use_demo = st.checkbox(
+            "Use built-in demo dataset (10 companies, 2009–2023)",
+            value=st.session_state.uploaded_file_path is not None
+                  and 'modified_financial_data' in str(st.session_state.uploaded_file_path)
+        )
+
+        if use_demo and not uploaded:
+            demo_path = os.path.abspath("src/data/modified_financial_data.csv")
+            if os.path.exists(demo_path):
+                st.session_state.uploaded_file_path = demo_path
+                st.success(f"✅ Demo dataset loaded")
+            else:
+                st.error("Demo dataset not found at src/data/modified_financial_data.csv")
+
+        if uploaded:
+            temp_dir  = tempfile.mkdtemp()
+            temp_path = os.path.join(temp_dir, "uploaded_data.csv")
+            with open(temp_path, 'wb') as f:
+                f.write(uploaded.getbuffer())
+            st.session_state.uploaded_file_path = temp_path
+            st.success(f"✅ Uploaded: {uploaded.name}")
+
+    with col_config:
+        st.markdown("#### 🏢 Company Selection")
+
+        if st.session_state.uploaded_file_path and os.path.exists(
+            st.session_state.uploaded_file_path
+        ):
+            try:
+                df_preview = pd.read_csv(st.session_state.uploaded_file_path)
+                company_col = next(
+                    (c for c in df_preview.columns if c.strip() == 'Company'), None
+                )
+                if company_col:
+                    df_preview[company_col] = df_preview[company_col].str.strip()
+                    companies = sorted(df_preview[company_col].unique().tolist())
+                    selected_company = st.selectbox(
+                        "Select Company",
+                        companies,
+                        index=companies.index(st.session_state.selected_company)
+                              if st.session_state.selected_company in companies else 0
+                    )
+                    st.session_state.selected_company = selected_company
+
+                    # Auto-detect sector
+                    if 'Category' in df_preview.columns:
+                        co_data = df_preview[df_preview[company_col] == selected_company]
+                        auto_sector = str(co_data['Category'].iloc[0]).strip() if len(co_data) > 0 else "IT"
+                    else:
+                        auto_sector = "IT"
+
+                    sector_options = ['IT', 'FinTech', 'Bank', 'BANK', 'Manufacturing',
+                                      'Finance', 'FOOD', 'ELEC', 'LOGI', 'Other']
+                    default_idx = sector_options.index(auto_sector) if auto_sector in sector_options else 0
+                    selected_sector = st.selectbox("Industry Sector", sector_options, index=default_idx)
+                    st.session_state.selected_sector = selected_sector
+
+            except Exception as e:
+                st.error(f"Cannot read file: {e}")
+
+    # Show data preview
+    if st.session_state.uploaded_file_path and os.path.exists(
+        st.session_state.uploaded_file_path
+    ):
+        df_prev = pd.read_csv(st.session_state.uploaded_file_path)
+        company_col = next((c for c in df_prev.columns if c.strip() == 'Company'), None)
+
+        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Total Rows", len(df_prev))
+        with c2:
+            st.metric("Columns", len(df_prev.columns))
+        with c3:
+            n_co = df_prev[company_col].nunique() if company_col else "N/A"
+            st.metric("Companies", n_co)
+        with c4:
+            years = sorted(df_prev['Period'].unique()) if 'Period' in df_prev.columns else []
+            period_str = f"{years[0]}–{years[-1]}" if len(years) >= 2 else "–"
+            st.metric("Period", period_str)
+
+        with st.expander("📋 Data Preview (first 10 rows)"):
+            st.dataframe(df_prev.head(10), use_container_width=True)
+
+        # ── RUN BUTTON ────────────────────────────────────────────────────────
+        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+        _, btn_col, _ = st.columns([1, 2, 1])
+        with btn_col:
+            run_clicked = st.button(
+                "🚀 Run Analysis",
+                type="primary",
+                use_container_width=True,
+                disabled=st.session_state.analysis_complete
+            )
+
+        if run_clicked:
+            if not st.session_state.selected_company:
+                st.error("Please select a company first.")
+                st.stop()
+
+            # Reset previous state
+            st.session_state.analysis_complete = False
+            st.session_state.flow_state        = None
+
+            # ── Progress UI ────────────────────────────────────────────────
+            progress_bar = st.progress(0, text="Initializing pipeline...")
+            status_ph    = st.empty()
+            log_ph       = st.empty()
+
+            os.makedirs("charts",  exist_ok=True)
+            os.makedirs("reports", exist_ok=True)
+            os.makedirs("logs",    exist_ok=True)
+
+            try:
+                from financial_fpa.flow import FinancialAnalysisFlow
+
+                progress_bar.progress(5, text="🔍 Validating input data...")
+                status_ph.info(f"Starting analysis for **{st.session_state.selected_company}**...")
+
+                flow = FinancialAnalysisFlow()
+                result = flow.kickoff(inputs={
+                    "csv_path":     st.session_state.uploaded_file_path,
+                    "company_name": st.session_state.selected_company,
+                    "sector":       st.session_state.selected_sector or "IT",
+                })
+
+                final = flow.state
+                step = final.current_step
+
+                # Show friendly status for rate-limit waits
+                if step.startswith("rate_limit_wait"):
+                    attempt_num = step.split("_")[-1]
+                    progress_bar.progress(
+                        50,
+                        text=f"⏳ Groq rate limit reached — auto-retrying (attempt {attempt_num}/5)…"
+                    )
+                    status_ph.info(
+                        "🔄 Groq TPM limit hit. The pipeline is **automatically waiting and retrying** — "
+                        "no action needed. This usually takes 15–30 seconds."
+                    )
+                else:
+                    progress_bar.progress(100, text="✅ Complete!")
+
+                if step == "completed":
+                    st.session_state.analysis_complete = True
+                    st.session_state.flow_state        = final
+                    status_ph.success(
+                        f"🎉 Analysis complete for **{st.session_state.selected_company}**! "
+                        f"Check Results & Download tabs."
+                    )
+                    # Save to history
+                    st.session_state.run_history.append({
+                        "company":   st.session_state.selected_company,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "pdf_path":  final.pdf_path,
+                    })
+                else:
+                    status_ph.warning(
+                        f"⚠️ Analysis ended at step: {step}. "
+                        f"{final.error_message or ''}"
+                    )
+                    if final.performance_result or final.cfo_result:
+                        st.session_state.analysis_complete = True
+                        st.session_state.flow_state        = final
+
+            except Exception as e:
+                progress_bar.progress(0)
+                st.error(f"❌ Pipeline error: {str(e)}")
+                with st.expander("🔍 Full Error"):
+                    import traceback
+                    st.code(traceback.format_exc())
+
+    else:
+        st.info("👆 Upload a CSV file or enable the demo dataset to get started.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — Results & Charts
+# ══════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.header("Analysis Results")
-    
-    if st.session_state.analysis_complete:
-        st.markdown('<div class="success-box"><strong>✅ Analysis Complete!</strong> View your results below.</div>', unsafe_allow_html=True)
-        
-        # Display charts
-        st.subheader("📊 Generated Charts")
-        
-        chart_files = {
-            "Revenue Trend": "charts/revenue_trend.png",
-            "Scenario Comparison": "charts/scenario_comparison.png",
-            "Risk Dashboard": "charts/risk_dashboard.png",
-            "Profitability Analysis": "charts/profitability_analysis.png"
-        }
-        
-        # Display charts in 2x2 grid
-        col1, col2 = st.columns(2)
-        
-        chart_items = list(chart_files.items())
-        
-        with col1:
-            for i in [0, 2]:
-                if i < len(chart_items):
-                    title, path = chart_items[i]
-                    if os.path.exists(path):
-                        st.markdown(f"**{title}**")
-                        st.image(path, use_container_width=True)
-                    else:
-                        st.warning(f"Chart not found: {title}")
-        
-        with col2:
-            for i in [1, 3]:
-                if i < len(chart_items):
-                    title, path = chart_items[i]
-                    if os.path.exists(path):
-                        st.markdown(f"**{title}**")
-                        st.image(path, use_container_width=True)
-                    else:
-                        st.warning(f"Chart not found: {title}")
-        
-        # Display insights
-        st.markdown("---")
-        st.subheader("💡 Key Insights")
-        
-        # Check for output files
-        if os.path.exists("reports/fpa_analysis_summary.md"):
-            with open("reports/fpa_analysis_summary.md", "r") as f:
-                summary = f.read()
-                st.markdown(summary)
-        else:
-            st.info("Executive summary will appear here after analysis completes.")
-    
-    else:
-        st.info("📊 Results will appear here after running the analysis")
-        st.markdown("""
-        The analysis will generate:
-        - 📈 Revenue trend visualization
-        - 📊 Scenario comparison chart
-        - ⚠️ Risk metrics dashboard
-        - 💰 Profitability analysis
-        - 📝 Executive insights
-        """)
 
-with tab3:
-    st.header("Download Report")
-    
-    if st.session_state.analysis_complete and st.session_state.pdf_path:
-        st.markdown('<div class="success-box"><strong>✅ PDF Report Ready!</strong></div>', unsafe_allow_html=True)
-        
-        # Report info
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Report Date", datetime.now().strftime("%Y-%m-%d"))
-        with col2:
-            if os.path.exists(st.session_state.pdf_path):
-                file_size = os.path.getsize(st.session_state.pdf_path) / 1024  # KB
-                st.metric("File Size", f"{file_size:.1f} KB")
-        
-        st.markdown("### 📄 Report Contents")
+    if not st.session_state.analysis_complete or not st.session_state.flow_state:
+        st.info("📊 Run the analysis to see results here.")
         st.markdown("""
-        - **Cover Page** - Title and date
-        - **Executive Summary** - Key findings
-        - **Performance Analysis** - Historical metrics with charts
-        - **Market Context** - Industry benchmarks
-        - **Scenario Planning** - Future projections with visualizations
-        - **Risk Assessment** - Financial stability analysis
-        - **Strategic Recommendations** - Actionable insights
+        **What you'll see after analysis:**
+        - 📈 Revenue trend chart
+        - 📊 Scenario comparison
+        - ⚠️ Risk dashboard
+        - 💰 Profitability analysis
+        - 🌊 Waterfall chart
+        - 🕸️ Financial radar
         """)
-        
-        # Download button
-        if os.path.exists(st.session_state.pdf_path):
-            with open(st.session_state.pdf_path, "rb") as pdf_file:
-                pdf_bytes = pdf_file.read()
-                
-                st.download_button(
-                    label="📥 Download PDF Report",
-                    data=pdf_bytes,
-                    file_name=f"FPA_Analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                    mime="application/pdf",
-                    type="primary",
-                    use_container_width=True
-                )
-        
-        # Download individual charts
-        st.markdown("---")
-        st.markdown("### 📊 Download Individual Charts")
-        
-        chart_cols = st.columns(4)
-        chart_files = {
-            "Revenue Trend": "charts/revenue_trend.png",
-            "Scenarios": "charts/scenario_comparison.png",
-            "Risk Dashboard": "charts/risk_dashboard.png",
-            "Profitability": "charts/profitability_analysis.png"
+    else:
+        state = st.session_state.flow_state
+        company = state.company_name
+
+        # Status banner
+        risk_level = "unknown"
+        if state.risk_result:
+            risk_level = state.risk_result.get('overall_risk_level', 'unknown')
+
+        banner_col1, banner_col2, banner_col3 = st.columns(3)
+        with banner_col1:
+            st.metric("Company", company)
+        with banner_col2:
+            st.metric("Analysis Status", state.current_step.replace("_", " ").title())
+        with banner_col3:
+            risk_color = {
+                'low': '🟢', 'moderate': '🟡', 'high': '🔴', 'critical': '💀'
+            }.get(risk_level, '⚪')
+            st.metric("Risk Level", f"{risk_color} {risk_level.upper()}")
+
+        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+
+        # Charts grid
+        st.subheader("📊 Generated Charts")
+        chart_map = {
+            "Revenue Trend":         "charts/revenue_trend.png",
+            "Profitability":         "charts/profitability_analysis.png",
+            "Scenario Comparison":   "charts/scenario_comparison.png",
+            "Risk Dashboard":        "charts/risk_dashboard.png",
+            "Revenue Waterfall":     "charts/waterfall_revenue.png",
+            "Financial Radar":       "charts/radar_metrics.png",
         }
-        
-        for idx, (name, path) in enumerate(chart_files.items()):
-            with chart_cols[idx]:
-                if os.path.exists(path):
-                    with open(path, "rb") as img_file:
+
+        existing = {k: v for k, v in chart_map.items() if os.path.exists(v)}
+        if existing:
+            chart_items = list(existing.items())
+            # Display 2 per row
+            for i in range(0, len(chart_items), 2):
+                cols = st.columns(2)
+                for j, col in enumerate(cols):
+                    if i + j < len(chart_items):
+                        title, path = chart_items[i + j]
+                        with col:
+                            st.markdown(f"**{title}**")
+                            st.image(path, use_container_width=True)
+        else:
+            st.warning("Charts not found — they may still be generating.")
+
+        # Key metrics summary
+        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+        st.subheader("⚡ Key Metrics Summary")
+
+        if state.performance_result:
+            pr = state.performance_result
+            rev = pr.get('revenue', {})
+            prof = pr.get('profitability', {})
+            cf   = pr.get('cash_flow', {})
+
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                cagr = rev.get('cagr', 0)
+                st.metric("Revenue CAGR", f"{cagr:.1f}%" if cagr else "N/A")
+            with m2:
+                yoy = rev.get('yoy_growth', 0)
+                st.metric("Latest YoY Growth", f"{yoy:.1f}%" if yoy is not None else "N/A",
+                          delta=f"{yoy:.1f}%" if yoy else None)
+            with m3:
+                margin = prof.get('current_ebitda_margin', 0)
+                st.metric("EBITDA Margin", f"{margin:.1f}%" if margin else "N/A")
+            with m4:
+                ocf = cf.get('operating_cash_flow', 0)
+                st.metric("Operating CF", f"${ocf:,.0f}M" if ocf else "N/A")
+
+            # Positives & Concerns
+            pos_col, neg_col = st.columns(2)
+            with pos_col:
+                st.markdown("**✅ Top Strengths**")
+                for p in pr.get('top_3_positives', []):
+                    st.markdown(f"- {p}")
+            with neg_col:
+                st.markdown("**⚠️ Top Concerns**")
+                for c in pr.get('top_3_concerns', []):
+                    st.markdown(f"- {c}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — Detailed Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    st.header("Detailed Structured Analysis")
+
+    if not st.session_state.analysis_complete or not st.session_state.flow_state:
+        st.info("Run the analysis to see detailed structured outputs here.")
+    else:
+        state = st.session_state.flow_state
+
+        # CFO Executive Summary
+        if state.cfo_result:
+            cfr = state.cfo_result
+            st.subheader("💼 CFO Executive Summary")
+            st.markdown(
+                f"> {cfr.get('executive_summary', 'Not available')}"
+            )
+            st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+
+            # Recommendations table
+            recs = cfr.get('recommendations', [])
+            if recs:
+                st.markdown("**Strategic Recommendations**")
+                rec_data = []
+                for r in recs:
+                    priority_icon = {
+                        'immediate':    '🔴',
+                        'short-term':   '🟡',
+                        'medium-term':  '🟢',
+                    }.get(r.get('priority', ''), '⚪')
+                    rec_data.append({
+                        "Priority":        f"{priority_icon} {r.get('priority', '').title()}",
+                        "Recommendation":  r.get('title', ''),
+                        "Rationale":       r.get('rationale', ''),
+                        "Expected Impact": r.get('expected_impact', ''),
+                    })
+                st.dataframe(pd.DataFrame(rec_data), use_container_width=True)
+
+        # Scenario Planning
+        if state.scenario_result:
+            sr = state.scenario_result
+            st.subheader("📈 Scenario Projections")
+            scenarios = sr.get('scenarios', [])
+            if scenarios:
+                sc_rows = []
+                for s in scenarios:
+                    sc_rows.append({
+                        "Scenario":    s.get('scenario_name', ''),
+                        "Growth Rate": f"{s.get('growth_rate', 0):.1f}%",
+                        "Probability": f"{s.get('probability_weight', 0):.0%}",
+                        "Year 1 ($M)": f"${s.get('year_1_revenue', 0):,.0f}",
+                        "Year 2 ($M)": f"${s.get('year_2_revenue', 0):,.0f}",
+                        "Year 3 ($M)": f"${s.get('year_3_revenue', 0):,.0f}",
+                    })
+                st.dataframe(pd.DataFrame(sc_rows), use_container_width=True)
+
+            drivers = sr.get('sensitivity_drivers', [])
+            if drivers:
+                st.markdown("**Key Sensitivity Drivers:**")
+                for d in drivers:
+                    st.markdown(f"- {d}")
+
+        # Risk Assessment
+        if state.risk_result:
+            rr = state.risk_result
+            st.subheader("⚠️ Risk Assessment")
+
+            risk_level = rr.get('overall_risk_level', 'unknown')
+            risk_class = f"risk-{risk_level}"
+            st.markdown(
+                f'Overall Risk Level: <span class="{risk_class}">'
+                f'{risk_level.upper()}</span>',
+                unsafe_allow_html=True
+            )
+            metrics = rr.get('metrics', [])
+            if metrics:
+                m_rows = []
+                for m in metrics:
+                    m_rows.append({
+                        "Metric":         m.get('metric_name', ''),
+                        "Value":          f"{m.get('current_value', 0):.2f}",
+                        "Threshold":      f"{m.get('threshold', 0):.2f}",
+                        "Status":         m.get('status', '').upper(),
+                        "Interpretation": m.get('interpretation', ''),
+                    })
+                st.dataframe(pd.DataFrame(m_rows), use_container_width=True)
+
+            flags = rr.get('risk_flags', [])
+            if flags:
+                st.markdown("**🚩 Active Risk Flags:**")
+                for flag in flags:
+                    st.warning(flag)
+
+        # Market Benchmarks
+        if state.market_result:
+            mr = state.market_result
+            st.subheader("🌍 Market Benchmark Comparison")
+            benchmarks = mr.get('benchmarks', [])
+            if benchmarks:
+                b_rows = []
+                for b in benchmarks:
+                    b_rows.append({
+                        "Metric":          b.get('metric_name', ''),
+                        "Company Value":   f"{b.get('company_value', 0):.2%}" if abs(b.get('company_value', 0)) < 10 else f"{b.get('company_value', 0):.2f}",
+                        "Industry Median": f"{b.get('industry_median', 0):.2%}" if abs(b.get('industry_median', 0)) < 10 else f"{b.get('industry_median', 0):.2f}",
+                        "Assessment":      b.get('assessment', '').title(),
+                    })
+                st.dataframe(pd.DataFrame(b_rows), use_container_width=True)
+
+            st.markdown(f"**Competitive Position:** {mr.get('competitive_position_summary', '')}")
+
+        # Raw JSON toggle
+        with st.expander("🔍 Raw Structured Output (JSON)"):
+            raw_state = {
+                "performance": state.performance_result,
+                "scenario":    state.scenario_result,
+                "risk":        state.risk_result,
+                "market":      state.market_result,
+                "cfo":         state.cfo_result,
+            }
+            st.json({k: v for k, v in raw_state.items() if v is not None})
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — Download Report
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.header("Download Reports")
+
+    if not st.session_state.analysis_complete or not st.session_state.flow_state:
+        st.info("📄 Reports will become available after running the analysis.")
+    else:
+        state = st.session_state.flow_state
+
+        # PDF Download
+        pdf_path = state.pdf_path
+        if pdf_path and os.path.exists(pdf_path):
+            st.markdown("### 📄 PDF Report")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("Report Date", datetime.now().strftime("%Y-%m-%d"))
+            with c2:
+                size_kb = os.path.getsize(pdf_path) / 1024
+                st.metric("File Size", f"{size_kb:.1f} KB")
+
+            with open(pdf_path, 'rb') as f:
+                pdf_bytes = f.read()
+
+            st.download_button(
+                label="📥 Download PDF Report",
+                data=pdf_bytes,
+                file_name=f"FPA_{state.company_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+            )
+        else:
+            st.warning("PDF report not available (generation may have failed).")
+
+        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+
+        # Chart Downloads
+        st.markdown("### 📊 Individual Charts")
+        chart_map = {
+            "Revenue Trend":       "charts/revenue_trend.png",
+            "Profitability":       "charts/profitability_analysis.png",
+            "Scenarios":           "charts/scenario_comparison.png",
+            "Risk Dashboard":      "charts/risk_dashboard.png",
+            "Revenue Waterfall":   "charts/waterfall_revenue.png",
+            "Financial Radar":     "charts/radar_metrics.png",
+        }
+        existing_charts = {k: v for k, v in chart_map.items() if os.path.exists(v)}
+        if existing_charts:
+            chart_cols = st.columns(min(3, len(existing_charts)))
+            for idx, (name, path) in enumerate(existing_charts.items()):
+                with chart_cols[idx % 3]:
+                    with open(path, 'rb') as img_file:
                         st.download_button(
                             label=f"📊 {name}",
                             data=img_file.read(),
                             file_name=os.path.basename(path),
                             mime="image/png",
-                            use_container_width=True
+                            use_container_width=True,
                         )
-    
-    else:
-        st.info("📄 PDF report will be available here after analysis completes")
-        st.markdown("""
-        The comprehensive PDF report will include:
-        - All generated charts
-        - Insights from all AI agents
-        - Executive summary
-        - Strategic recommendations
-        - Professional formatting
-        """)
 
-# Footer
+        # JSON Export
+        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+        st.markdown("### 📋 Structured Data Export")
+        structured_data = {
+            "company":     state.company_name,
+            "sector":      state.sector,
+            "timestamp":   datetime.now().isoformat(),
+            "performance": state.performance_result,
+            "scenarios":   state.scenario_result,
+            "risk":        state.risk_result,
+            "market":      state.market_result,
+            "cfo":         state.cfo_result,
+        }
+        json_str = json.dumps(
+            {k: v for k, v in structured_data.items() if v is not None},
+            indent=2
+        )
+        st.download_button(
+            label="📋 Download JSON (Structured Data)",
+            data=json_str,
+            file_name=f"FPA_{state.company_name}_{datetime.now().strftime('%Y%m%d')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        # Run history
+        if st.session_state.run_history:
+            st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+            st.markdown("### 🕒 Analysis History")
+            hist_df = pd.DataFrame(st.session_state.run_history)
+            st.dataframe(hist_df, use_container_width=True)
+
+# ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666; padding: 1rem;'>
-    <strong>Financial FP&A Analysis System</strong><br>
-    Powered by CrewAI | Enterprise-Grade Financial Intelligence
-</div>
-""", unsafe_allow_html=True)
-
+st.markdown(
+    "<div style='text-align:center;color:#555;padding:0.5rem;font-size:0.85rem;'>"
+    "<strong>Financial FP&A Intelligence v2</strong> · "
+    "Powered by CrewAI Flows · "
+    "Structured Outputs · Knowledge Sources · Memory"
+    "</div>",
+    unsafe_allow_html=True
+)
 
 if __name__ == "__main__":
-    # Ensure required directories exist
-    os.makedirs("charts", exist_ok=True)
+    os.makedirs("charts",  exist_ok=True)
     os.makedirs("reports", exist_ok=True)
+    os.makedirs("logs",    exist_ok=True)

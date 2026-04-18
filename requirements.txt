@@ -1,7 +1,7 @@
-# Financial FP&A CrewAI - Enhanced Dependencies
+# Financial FP&A CrewAI — Complete Dependencies v2
 
-# Core CrewAI
-crewai[tools]>=0.86.0,<1.0.0
+# Core CrewAI (supports Flows, Knowledge Sources, Memory, Guardrails)
+crewai[tools]>=1.0.0,<2.0.0
 
 # Data Processing
 pandas>=2.0.0
@@ -15,10 +15,12 @@ seaborn>=0.12.0
 reportlab>=4.0.0
 pillow>=10.0.0
 
+# LLM Provider
+groq>=0.8.0
+
+# Embeddings (local, no external API required — used by CrewAI's huggingface embedder)
+sentence-transformers>=2.2.0
+
 # Web Interface
 streamlit>=1.28.0
-
-# Already included in crewai[tools]:
-# - SerperDevTool
-# - ScrapeWebsiteTool
-# - Other CrewAI tools
+python-dotenv>=1.0.0

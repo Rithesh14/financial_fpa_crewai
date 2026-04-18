@@ -1,69 +1,100 @@
+# FP&A CrewAI Task Definitions
+#
+# DESIGN RULES (read before editing):
+#
+#   1. fpa_analysis_tool is EXPENSIVE (reads CSV, runs full analytics).
+#      Call it ONLY in performance_analysis_task and chart_generation_task.
+#      Every other task has `context:` from performance_analysis_task —
+#      use that context instead.  Calling fpa_analysis_tool without a valid
+#      csv_path causes the agent to guess a filename, fail, retry, and burn
+#      ~1–2 K tokens per failed attempt before hitting the Groq TPM limit.
+#
+#   2. Chart tools that take csv_path must receive EXACTLY {csv_path}.
+#      Never omit it or the tool will raise FileNotFoundError.
+#
+#   3. BenchmarkComparison.company_value must be a float (not null/None).
+#      When a metric is unavailable, output 0.0 and note it in the assessment.
+
 performance_analysis_task:
   description: >
-    Analyze the financial performance of the company using the provided dataset.
-    Use the FPA analysis tool to extract key metrics including:
-    - Revenue growth trends
-    - EBITDA margins and profitability
-    - Operating cash flow health
-    
-    Focus strictly on historical and current performance.
-    Provide clear, business-language explanations of what the numbers reveal.
-    
-    Dataset path: {csv_path}
+    Analyze {company_name} using the dataset at {csv_path}.
+
+    Call fpa_analysis_tool with EXACTLY these string arguments:
+      csv_path="{csv_path}", company="{company_name}", sector="IT"
+    Do NOT use any other csv_path value — do not guess or invent filenames.
+
+    Then call:
+      generate_revenue_trend_chart(csv_path="{csv_path}", company="{company_name}")
+      generate_profitability_analysis_chart(csv_path="{csv_path}", company="{company_name}")
+
+    Report:
+    1. Revenue CAGR over full period (as a percentage, e.g. 18.61 for 18.61%)
+    2. YoY revenue growth for last 5 years
+    3. Latest EBITDA margin and 5-year trend (as a percentage, e.g. 33.1 for 33.1%)
+    4. Operating cash flow (latest + average)
+    5. Cash conversion ratio
+    6. Top 3 positives and top 3 concerns
   expected_output: >
-    A detailed performance analysis report containing:
-    - Revenue growth analysis with trend interpretation
-    - Profitability metrics (EBITDA margin) with business context
-    - Cash flow health assessment
-    - Key insights on financial efficiency
-    Formatted as clear business narrative without technical jargon.
+    Structured performance report for {company_name} following the PerformanceAnalysisOutput schema:
+    company_name, analysis_period, revenue (current_revenue, yoy_growth, cagr, trend),
+    profitability (current_ebitda_margin, margin_trend, operating_leverage_evidence),
+    cash_flow (operating_cash_flow, cash_conversion_ratio, free_cash_flow),
+    top_3_positives (list of 3), top_3_concerns (list of 3).
+
+    IMPORTANT: Store cagr and yoy_growth as plain percentages (e.g. 18.61, not 0.1861).
+    Store current_ebitda_margin as a plain percentage (e.g. 33.1, not 0.331).
   agent: fpa_analyst
 
 market_research_task:
   description: >
-    Provide industry context and benchmark analysis to contextualize
-    the company's financial performance.
-    
-    Using your knowledge of financial industry standards and best practices:
-    - Estimate typical industry EBITDA margins for similar companies
-    - Provide context on typical revenue growth rates
-    - Discuss general market trends affecting financial performance
-    - Offer perspective on how the metrics compare to industry norms
-    
-    Note: Use your general knowledge and the LLM's understanding of
-    financial markets to provide context. Focus on providing valuable
-    comparative insights based on the data provided.
+    Compare {company_name}'s metrics against {benchmark_sector} industry benchmarks
+    from your knowledge base.
+
+    *** DO NOT call fpa_analysis_tool or any other data tool. ***
+    All company metric values are already in your context from performance_analysis_task.
+    Extract: EBITDA margin, revenue growth, debt/equity ratio, current ratio from context.
+
+    For ROE — if it is not present in context, set company_value=0.0 and note
+    "ROE not available in dataset" in the assessment field. Do NOT output null.
+
+    For each key metric (EBITDA margin, revenue growth, debt/equity, current ratio, ROE):
+      - company_value: number from context (use 0.0 if genuinely missing, never null)
+      - industry_median: from your knowledge base only — never invent numbers
+      - assessment: "Outperforms", "Matches", or "Underperforms"
+
+    List 3 key market trends for {benchmark_sector}.
   expected_output: >
-    A market context report containing:
-    - Industry benchmark estimates and comparisons
-    - General competitive positioning analysis
-    - Relevant market trends and economic context
-    - Assessment of performance relative to typical industry standards
-    Formatted as a concise market intelligence brief.
+    Market intelligence report following MarketResearchOutput schema:
+    company_name, sector, benchmarks (list of BenchmarkComparison — company_value MUST
+    be a float, use 0.0 if unknown), market_trends (list of 3), competitive_position_summary.
   agent: market_researcher
   context:
     - performance_analysis_task
 
 scenario_planning_task:
   description: >
-    Based on the performance analysis results, create forward-looking scenarios.
-    Use the FPA analysis tool to generate best-case, base-case, and worst-case scenarios.
-    
-    Your scenarios should be:
-    - Grounded in historical performance data
-    - Realistic and conservative
-    - Clearly differentiated by assumptions
-    
-    Consider asking the FPA Analyst for clarification on trends if needed.
-    
-    Dataset path: {csv_path}
+    Create 3 revenue scenarios for {company_name}.
+
+    *** DO NOT call fpa_analysis_tool. ***
+    All required data (base revenue, CAGR, growth trend) is already in your context
+    from performance_analysis_task. Use those numbers directly.
+
+    Methodology:
+    - Base growth rate = CAGR from context
+    - σ (standard deviation) = 3.0% if historical volatility is not available in context
+    - Best Case  growth = CAGR + σ  (probability weight: 0.25)
+    - Base Case  growth = CAGR      (probability weight: 0.50)
+    - Worst Case growth = CAGR − σ  (probability weight: 0.25)
+
+    Calculate Y1/Y2/Y3 revenues by compounding from base_revenue.
+    Then call: generate_scenario_comparison_chart(csv_path="{csv_path}", company="{company_name}")
+    List top 3 sensitivity drivers.
   expected_output: >
-    A scenario planning report with:
-    - Best-case scenario with revenue projections and assumptions
-    - Base-case scenario as the most likely outcome
-    - Worst-case scenario with downside risks
-    - Clear explanation of what drives each scenario
-    Formatted as executive summary suitable for leadership review.
+    Scenario plan following ScenarioPlanningOutput schema:
+    company_name, base_revenue (float, in millions), scenarios (list of exactly 3
+    ScenarioProjection: scenario_name, growth_rate as plain percentage e.g. 8.79,
+    assumptions list, year_1_revenue, year_2_revenue, year_3_revenue, probability_weight),
+    sensitivity_drivers (list of 3 strings).
   agent: scenario_analyst
   context:
     - performance_analysis_task
@@ -71,23 +102,29 @@ scenario_planning_task:
 
 risk_assessment_task:
   description: >
-    Evaluate the financial stability and risk profile of the company.
-    Use the FPA analysis tool to assess:
-    - Liquidity position (current ratio)
-    - Leverage and debt sustainability (debt/equity ratio)
-    - Cash flow stability
-    
-    Be conservative in your assessment. Flag any warning signs.
-    You may ask the FPA Analyst or Market Researcher for additional context.
-    
-    Dataset path: {csv_path}
+    Assess financial risk for {company_name}.
+
+    *** DO NOT call fpa_analysis_tool. ***
+    All required data (debt/equity ratio, current ratio, OCF, EBITDA margin) is
+    already in your context from performance_analysis_task. Use those numbers directly.
+
+    Classify each metric against these thresholds:
+    - Debt/Equity: threshold = 1.5 for {benchmark_sector} sector
+      (HIGH risk if > 1.5, MODERATE if 1.0–1.5, LOW if < 1.0)
+    - Current Ratio: CRITICAL if < 1.0, HIGH if 1.0–1.5, LOW if > 1.5
+    - OCF trend: assess direction from context (positive/stable/declining)
+    - EBITDA margin: LOW risk if > 20%, MODERATE if 10–20%, HIGH if < 10%
+
+    All metric current_value and threshold fields MUST be floats — use 0.0
+    if a value is genuinely unknown, never leave them as null.
+
+    Then call: generate_risk_dashboard(csv_path="{csv_path}", company="{company_name}")
+    Provide exactly 3 mitigation recommendations as plain strings.
   expected_output: >
-    A risk assessment report containing:
-    - Liquidity analysis with current ratio interpretation
-    - Leverage assessment with debt/equity analysis
-    - Cash sustainability evaluation
-    - Risk flags and recommendations for mitigation
-    Formatted as a risk briefing for CFO review.
+    Risk report following RiskAssessmentOutput schema:
+    company_name, overall_risk_level ("low"/"moderate"/"high"/"critical"),
+    metrics (list of RiskMetric — current_value and threshold are floats, not null),
+    risk_flags (list of strings), mitigation_recommendations (list of exactly 3 strings).
   agent: risk_analyst
   context:
     - performance_analysis_task
@@ -95,21 +132,23 @@ risk_assessment_task:
 
 chart_generation_task:
   description: >
-    Generate professional visual charts to illustrate financial insights.
-    
-    Use the chart generation tools to create:
-    1. Revenue trend chart - showing revenue over time with trend line
-    2. Scenario comparison chart - visualizing best/base/worst cases
-    3. Risk metrics dashboard - showing liquidity and leverage trends
-    4. Profitability analysis chart - EBITDA margin vs revenue
-    
-    All charts should be saved to the charts/ directory.
-    Ensure charts are professional, clear, and board-ready.
-    
-    Dataset path: {csv_path}
+    Generate all remaining charts for {company_name}.
+    For every chart tool call, pass EXACTLY csv_path="{csv_path}" and company="{company_name}".
+    Do NOT omit csv_path or guess filenames.
+
+    Generate in this order:
+    1. generate_revenue_trend_chart(csv_path="{csv_path}", company="{company_name}")
+    2. generate_profitability_analysis_chart(csv_path="{csv_path}", company="{company_name}")
+    3. generate_scenario_comparison_chart(csv_path="{csv_path}", company="{company_name}")
+    4. generate_risk_dashboard(csv_path="{csv_path}", company="{company_name}")
+    5. generate_waterfall_chart(csv_path="{csv_path}", company="{company_name}")
+    6. generate_radar_chart(csv_path="{csv_path}", company="{company_name}")
+
+    For each chart, confirm the output file path and provide one-line insight.
+    Skip any chart that already has an output file in the charts/ directory.
   expected_output: >
-    Confirmation that all 4 charts have been generated successfully,
-    with file paths and brief description of insights visible in each chart.
+    Confirmation of up to 6 charts generated in charts/ directory.
+    For each: chart name, file path (e.g. charts/revenue_trend.png), one-line insight.
   agent: fpa_analyst
   context:
     - performance_analysis_task
@@ -118,65 +157,25 @@ chart_generation_task:
 
 cfo_advisory_task:
   description: >
-    Synthesize all previous analyses into a concise, executive-level summary.
-    
-    You will receive:
-    - Performance analysis from the FPA analyst
-    - Market context from the market researcher
-    - Scenario planning from the scenario analyst
-    - Risk assessment from the risk analyst
-    - Chart generation confirmation
-    
-    Your job is to:
-    - Integrate insights from all analyses
-    - Highlight the most critical findings
-    - Provide strategic recommendations
-    - Present in a board-ready format
-    
-    You may ask questions to any specialist for clarification.
-    Do NOT recalculate numbers. Focus on interpretation and strategic implications.
-  expected_output: >
-    An executive summary suitable for CFO and board presentation containing:
-    - Executive Overview (2-3 key takeaways)
-    - Performance Highlights (from FPA analyst)
-    - Market Position (from market researcher)
-    - Future Outlook (from scenario analyst)
-    - Risk Considerations (from risk analyst)
-    - Strategic Recommendations (3-5 actionable items)
-    
-    Formatted as a polished executive memo, maximum 2 pages equivalent.
-    Use clear headings, bullet points, and professional tone.
-  agent: cfo_advisor
-  context:
-    - performance_analysis_task
-    - market_research_task
-    - scenario_planning_task
-    - risk_assessment_task
-    - chart_generation_task
+    Synthesize all findings for {company_name} into a board-ready executive memo.
 
-pdf_generation_task:
-  description: >
-    Compile all analyses, insights, and charts into a comprehensive
-    PDF report suitable for board presentation.
-    
-    The PDF should include:
-    - Cover page with report date
-    - Table of contents
-    - Executive summary (from CFO Advisor)
-    - Performance analysis section with charts
-    - Market context section
-    - Scenario planning section with comparison chart
-    - Risk assessment section with dashboard
-    - Strategic recommendations
-    - Professional formatting throughout
-    
-    Use the PDF generation tool to create the report.
-    Ensure all charts from the charts/ directory are embedded.
-    
-    Dataset path: {csv_path}
+    *** DO NOT call any tools. DO NOT invent new numbers. ***
+    Use ONLY the outputs already present in your context from all prior tasks.
+
+    Write:
+    - executive_summary: exactly 2-3 sentences for the board
+    - performance_highlights: exactly 3 items (strings)
+    - risk_considerations: exactly 3 items (strings)
+    - future_outlook: 1-2 sentences
+    - recommendations: exactly 3 to 5 StrategicRecommendation objects, each with:
+        title (string), rationale (string),
+        priority ("immediate" | "short-term" | "medium-term"),
+        expected_impact (string)
   expected_output: >
-    Confirmation that the PDF report has been generated successfully
-    at reports/fpa_analysis.pdf, with a summary of included sections.
+    Executive advisory memo following CFOAdvisoryOutput schema:
+    company_name, executive_summary, performance_highlights (list of 3),
+    risk_considerations (list of 3), future_outlook,
+    recommendations (list of 3-5 StrategicRecommendation with title/rationale/priority/expected_impact).
   agent: cfo_advisor
   context:
     - performance_analysis_task
@@ -184,5 +183,3 @@ pdf_generation_task:
     - scenario_planning_task
     - risk_assessment_task
     - chart_generation_task
-    - cfo_advisory_task
-  output_file: reports/fpa_analysis_summary.md

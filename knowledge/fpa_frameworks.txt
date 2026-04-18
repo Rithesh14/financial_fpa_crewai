@@ -1,0 +1,51 @@
+DuPont Analysis: ROE = Net Profit Margin × Asset Turnover × Equity Multiplier.
+Used to identify whether returns are driven by profitability, efficiency, or leverage.
+
+Altman Z-Score: Z = 1.2*A + 1.4*B + 3.3*C + 0.6*D + 1.0*E
+Where A=Working Capital/Total Assets, B=Retained Earnings/Total Assets,
+C=EBIT/Total Assets, D=Market Cap/Total Liabilities, E=Revenue/Total Assets.
+Z > 2.99 = Safe Zone, 1.81-2.99 = Grey Zone, < 1.81 = Distress Zone.
+
+Cash Conversion Cycle = DSO + DIO - DPO
+DSO = Days Sales Outstanding, DIO = Days Inventory Outstanding, DPO = Days Payable Outstanding.
+
+Sustainable Growth Rate = ROE × (1 - Dividend Payout Ratio)
+Maximum growth rate achievable without external equity financing.
+
+EBITDA Margin = EBITDA / Revenue. Measures operating profitability before
+capital structure, tax, and depreciation effects.
+
+Revenue CAGR = (Ending Value / Beginning Value)^(1/years) - 1
+Compound Annual Growth Rate smooths out period-to-period volatility.
+
+Free Cash Flow = Operating Cash Flow - Capital Expenditures
+Represents cash available for distribution to investors after maintaining/expanding asset base.
+
+Cash Conversion Ratio = Operating Cash Flow / Net Income
+Measures how effectively a company converts profits into cash. Ratio > 1 indicates strong cash generation.
+
+Debt Service Coverage Ratio = EBITDA / Total Debt Service
+Measures ability to service debt obligations. Ratio > 1.5 is generally considered safe.
+
+Current Ratio = Current Assets / Current Liabilities
+Measures short-term liquidity. Ratio > 1.0 means company can cover short-term obligations.
+1.5-2.0 is considered healthy for most industries.
+
+Debt-to-Equity Ratio = Total Debt / Shareholders' Equity
+Measures financial leverage. Higher ratios indicate more debt financing.
+Industry context matters: banks naturally have higher ratios than tech companies.
+
+Return on Equity (ROE) = Net Income / Shareholders' Equity
+Measures profitability relative to equity. Higher ROE indicates efficient use of equity capital.
+
+Working Capital = Current Assets - Current Liabilities
+Positive working capital indicates ability to fund day-to-day operations.
+Negative working capital might indicate liquidity problems or efficient capital management (like in retail).
+
+Operating Leverage = % Change in EBIT / % Change in Revenue
+Higher operating leverage means fixed costs are a larger proportion of total costs.
+Companies with high operating leverage benefit more from revenue increases but are more vulnerable to decreases.
+
+Price-to-Earnings (P/E) Ratio = Market Price per Share / Earnings per Share
+Indicates how much investors are willing to pay per dollar of earnings.
+High P/E can indicate growth expectations or overvaluation; low P/E can indicate value or distress.
