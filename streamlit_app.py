@@ -238,11 +238,8 @@ with tab1:
                     else:
                         auto_sector = "IT"
 
-                    sector_options = ['IT', 'FinTech', 'Bank', 'BANK', 'Manufacturing',
-                                      'Finance', 'FOOD', 'ELEC', 'LOGI', 'Other']
-                    default_idx = sector_options.index(auto_sector) if auto_sector in sector_options else 0
-                    selected_sector = st.selectbox("Industry Sector", sector_options, index=default_idx)
-                    st.session_state.selected_sector = selected_sector
+                    st.text_input("Industry Sector", value=auto_sector, disabled=True)
+                    st.session_state.selected_sector = auto_sector
 
             except Exception as e:
                 st.error(f"Cannot read file: {e}")
