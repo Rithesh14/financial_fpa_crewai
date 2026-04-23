@@ -2,7 +2,7 @@
 name = "financial_fpa"
 version = "0.1.0"
 description = "financial_FPA using crewAI"
-authors = [{ name = "Your Name", email = "you@example.com" }]
+authors = [{ name = "Rithesh Shetty", email = "ritheshshetty2004@gmail.com" }]
 requires-python = ">=3.10,<=3.13"
 dependencies = [
     "crewai[tools]>=0.86.0,<1.0.0"
