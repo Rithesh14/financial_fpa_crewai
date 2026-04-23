@@ -19,12 +19,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from dotenv import load_dotenv
 load_dotenv()
 
-if not os.getenv('OPENAI_API_BASE'):
-    os.environ['OPENAI_API_BASE'] = 'https://api.groq.com/openai/v1'
-if not os.getenv('OPENAI_MODEL_NAME'):
-    os.environ['OPENAI_MODEL_NAME'] = 'meta-llama/llama-4-scout-17b-16e-instruct'
-if not os.getenv('OPENAI_API_KEY') and os.getenv('GROQ_API_KEY'):
-    os.environ['OPENAI_API_KEY'] = os.getenv('GROQ_API_KEY')
+if not os.getenv('GEMINI_API_KEY') and os.getenv('OPENAI_API_KEY'):
+    os.environ['GEMINI_API_KEY'] = os.getenv('OPENAI_API_KEY')
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -131,19 +127,10 @@ with st.sidebar:
     st.markdown("### ⚙️ Configuration")
 
     # LLM Status
-    base_url   = os.getenv('OPENAI_API_BASE', '')
-    model_name = os.getenv('OPENAI_MODEL_NAME', '')
-    api_key    = os.getenv('OPENAI_API_KEY', '')
+    gemini_key = os.getenv('GEMINI_API_KEY', '')
 
-    groq_key   = os.getenv('GROQ_API_KEY', '')
-
-    if 'groq.com' in base_url or groq_key:
-        display_model = model_name.replace('groq/', '')
-        st.success(f"✅ Groq · `{display_model}`")
-    elif 'localhost' in base_url:
-        st.success(f"✅ Ollama · `{model_name}`")
-    elif api_key and api_key != 'NA':
-        st.success("✅ OpenAI API")
+    if gemini_key:
+        st.success(f"✅ Gemini · `gemini-2.5-flash-lite`")
     else:
         st.error("❌ LLM not configured")
 
@@ -337,19 +324,7 @@ with tab1:
                 final = flow.state
                 step = final.current_step
 
-                # Show friendly status for rate-limit waits
-                if step.startswith("rate_limit_wait"):
-                    attempt_num = step.split("_")[-1]
-                    progress_bar.progress(
-                        50,
-                        text=f"⏳ Groq rate limit reached — auto-retrying (attempt {attempt_num}/5)…"
-                    )
-                    status_ph.info(
-                        "🔄 Groq TPM limit hit. The pipeline is **automatically waiting and retrying** — "
-                        "no action needed. This usually takes 15–30 seconds."
-                    )
-                else:
-                    progress_bar.progress(100, text="✅ Complete!")
+                progress_bar.progress(100, text="✅ Complete!")
 
                 if step == "completed":
                     st.session_state.analysis_complete = True
@@ -444,7 +419,7 @@ with tab2:
                         title, path = chart_items[i + j]
                         with col:
                             st.markdown(f"**{title}**")
-                            st.image(path, use_container_width=True)
+                            st.image(path, use_column_width=True)
         else:
             st.warning("Charts not found — they may still be generating.")
 

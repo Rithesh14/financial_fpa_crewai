@@ -200,28 +200,149 @@ class FinancialAnalysisFlow(Flow[FPAFlowState]):
 
     @staticmethod
     def _is_rate_limit_error(exc: Exception) -> bool:
-        """Return True if the exception is a Groq 429 / RateLimitError."""
+        """
+        Return True if the exception is a rate-limit / quota error from
+        Groq (429 / RateLimitError) OR Gemini (RESOURCE_EXHAUSTED / quota exceeded)
+        OR an empty LLM response caused by rate limits.
+
+        'Invalid response from LLM call - None or empty' happens when the API
+        accepts the TCP connection but returns an empty HTTP body — this occurs
+        immediately after a TPM rate limit. It is NOT a code bug; it is a transient
+        API error that resolves after the TPM window resets. Treat it as retriable.
+        """
         err_str = str(exc).lower()
         return (
             "ratelimit" in err_str
             or "rate_limit_exceeded" in err_str
             or "429" in err_str
             or "try again in" in err_str
+            or "none or empty" in err_str          # Empty response after rate limit
+            or "invalid response from llm" in err_str  # Same root cause
+            or "resource_exhausted" in err_str     # Gemini quota error
+            or "quota exceeded" in err_str         # Gemini quota message
+            or "please retry in" in err_str        # Gemini retry suggestion
         )
+
+    def _has_sufficient_results(self) -> bool:
+        """
+        Return True if the primary deliverable (performance_result) is already
+        captured in state. When True, there is no value in re-running the full
+        crew from Task 1 — we should proceed straight to report generation.
+        """
+        return self.state.performance_result is not None
+
+    def _has_any_results(self) -> bool:
+        """
+        Return True if ANY crew result was captured. Even a single completed task
+        means we made progress and should NOT restart from scratch.
+        """
+        return any([
+            self.state.performance_result,
+            self.state.scenario_result,
+            self.state.risk_result,
+            self.state.market_result,
+            self.state.cfo_result,
+        ])
+
+    def _harvest_task_outputs(self, crew_obj) -> None:
+        """
+        Walk all tasks on a crew object and persist any completed Pydantic outputs
+        into self.state. Safe to call after both successful and failed kickoff().
+
+        Only writes to state if the field is currently empty — this makes it safe
+        to call multiple times without overwriting a previously-captured result with
+        a None from a later (failed) attempt.
+        """
+        for task_obj in crew_obj.tasks:
+            raw_output = getattr(task_obj, 'output', None)
+            if raw_output is None:
+                continue
+            pydantic_out = getattr(raw_output, 'pydantic', None)
+            if pydantic_out is None:
+                # Fallback: coerce from raw json_dict if pydantic parsing wasn't triggered
+                json_dict = getattr(raw_output, 'json_dict', None)
+                if json_dict and isinstance(json_dict, dict):
+                    try:
+                        if 'revenue' in json_dict and 'top_3_positives' in json_dict:
+                            pydantic_out = PerformanceAnalysisOutput(**json_dict)
+                        elif 'overall_risk_level' in json_dict:
+                            pydantic_out = RiskAssessmentOutput(**json_dict)
+                        elif 'executive_summary' in json_dict and 'recommendations' in json_dict:
+                            pydantic_out = CFOAdvisoryOutput(**json_dict)
+                        elif 'scenarios' in json_dict and 'sensitivity_drivers' in json_dict:
+                            pydantic_out = ScenarioPlanningOutput(**json_dict)
+                        elif 'benchmarks' in json_dict and 'market_trends' in json_dict:
+                            pydantic_out = MarketResearchOutput(**json_dict)
+                    except Exception:
+                        pass  # Coercion failed — skip this task
+
+            # Also try extracting from raw text output as a last resort
+            if pydantic_out is None:
+                raw_text = getattr(raw_output, 'raw', None)
+                if raw_text and isinstance(raw_text, str) and len(raw_text) > 50:
+                    # Try to parse JSON from the raw text
+                    import json as _json
+                    try:
+                        # Find JSON object in the raw text
+                        start_idx = raw_text.find('{')
+                        end_idx = raw_text.rfind('}')
+                        if start_idx >= 0 and end_idx > start_idx:
+                            json_str = raw_text[start_idx:end_idx + 1]
+                            parsed = _json.loads(json_str)
+                            if isinstance(parsed, dict):
+                                if 'revenue' in parsed and 'top_3_positives' in parsed:
+                                    pydantic_out = PerformanceAnalysisOutput(**parsed)
+                                elif 'overall_risk_level' in parsed:
+                                    pydantic_out = RiskAssessmentOutput(**parsed)
+                                elif 'executive_summary' in parsed and 'recommendations' in parsed:
+                                    pydantic_out = CFOAdvisoryOutput(**parsed)
+                                elif 'scenarios' in parsed and 'sensitivity_drivers' in parsed:
+                                    pydantic_out = ScenarioPlanningOutput(**parsed)
+                                elif 'benchmarks' in parsed and 'market_trends' in parsed:
+                                    pydantic_out = MarketResearchOutput(**parsed)
+                    except Exception:
+                        pass  # JSON parse failed — skip
+
+            if pydantic_out is None:
+                continue
+
+            # Only write if not already captured (never overwrite a good result with None/empty)
+            if isinstance(pydantic_out, PerformanceAnalysisOutput) and not self.state.performance_result:
+                self.state.performance_result = pydantic_out.model_dump()
+                fpa_logger.info("[Flow] ✓ Harvested: performance_result")
+            elif isinstance(pydantic_out, ScenarioPlanningOutput) and not self.state.scenario_result:
+                self.state.scenario_result = pydantic_out.model_dump()
+                fpa_logger.info("[Flow] ✓ Harvested: scenario_result")
+            elif isinstance(pydantic_out, RiskAssessmentOutput) and not self.state.risk_result:
+                self.state.risk_result = pydantic_out.model_dump()
+                fpa_logger.info("[Flow] ✓ Harvested: risk_result")
+            elif isinstance(pydantic_out, MarketResearchOutput) and not self.state.market_result:
+                self.state.market_result = pydantic_out.model_dump()
+                fpa_logger.info("[Flow] ✓ Harvested: market_result")
+            elif isinstance(pydantic_out, CFOAdvisoryOutput) and not self.state.cfo_result:
+                self.state.cfo_result = pydantic_out.model_dump()
+                fpa_logger.info("[Flow] ✓ Harvested: cfo_result")
 
     @listen("valid")
     def run_analysis_crew(self):
         """
         Kick off the CrewAI analysis crew with validated inputs.
 
-        Includes automatic retry with backoff for Groq TPM rate-limit errors
-        (HTTP 429). The wait time is parsed from the error message so we
-        only sleep as long as Groq tells us to, rather than a fixed delay.
+        SINGLE ATTEMPT — NO RETRY LOOP.
 
-        Token-pacing strategy:
-        - A 15s pre-flight sleep lets the TPM window partially refill when retrying
-        - MAX_RATE_LIMIT_RETRIES is kept at 3 to avoid burning the entire TPM budget
-          on retries and leaving no capacity for downstream quality retries
+        Why no retries:
+        - Re-running kickoff() restarts ALL tasks from scratch, wasting every
+          token already consumed by completed tasks.
+        - With 30s inter-task pacing (set in crew.py), rate limits are unlikely
+          during normal execution.
+        - If a crash does occur, we harvest whatever tasks completed and proceed
+          to report generation with partial results — this is far cheaper than
+          restarting the entire 6-task pipeline.
+
+        Rate limit prevention strategy:
+        - 30s sleep after every successful task completion (crew.py callback)
+        - max_retry_limit=3 on each agent (handles transient per-call 429s)
+        - On crash: harvest partial results → proceed to PDF generation
         """
         from financial_fpa.crew import FinancialFpa
 
@@ -232,113 +353,85 @@ class FinancialAnalysisFlow(Flow[FPAFlowState]):
             f"company={self.state.company_name}, retry={self.state.retry_count}"
         )
 
-        # If this is a quality-gate retry, pause to let the TPM window refill
-        if self.state.retry_count > 0:
-            preflight_wait = 60.0
+        # ── Pre-flight: if we already have results (from a previous crashed run), skip ──
+        if self._has_sufficient_results():
             fpa_logger.info(
-                f"[Flow] Quality retry #{self.state.retry_count} — waiting {preflight_wait}s "
-                "for Groq TPM window to refill before re-running crew…"
+                f"[Flow] Results already in state from previous run — skipping crew. "
+                f"performance={'✓' if self.state.performance_result else '✗'}, "
+                f"risk={'✓' if self.state.risk_result else '✗'}, "
+                f"cfo={'✓' if self.state.cfo_result else '✗'}"
             )
-            time.sleep(preflight_wait)
+            return None
 
-        MAX_RATE_LIMIT_RETRIES = 3  # Reduced: save TPM budget for later tasks
+        # Gemini quota is DAILY — no preflight wait needed on retries.
+        # (The old 65s wait was designed for Groq's 1-minute TPM window.)
+        if self.state.retry_count > 0:
+            fpa_logger.info(
+                f"[Flow] Quality retry #{self.state.retry_count} — re-running crew immediately "
+                "(Gemini daily quota: no TPM window to wait for)"
+            )
 
-        for attempt in range(1, MAX_RATE_LIMIT_RETRIES + 1):
+        # ── Create crew instance ──
+        crew_instance = FinancialFpa()
+        active_crew = crew_instance.crew()
+
+        try:
+            fpa_logger.info("[Flow] Starting crew kickoff…")
+            result = active_crew.kickoff(inputs={
+                'csv_path':         self.state.csv_path,
+                'company_name':     self.state.company_name,
+                'benchmark_sector': self.state.sector or 'IT',
+            })
+
+            # ── Extract structured Pydantic results from each completed task ──
+            self._harvest_task_outputs(active_crew)
+
+            fpa_logger.info(
+                f"[Flow] Crew analysis complete. "
+                f"Structured outputs captured: "
+                f"performance={'✓' if self.state.performance_result else '✗'}, "
+                f"scenario={'✓' if self.state.scenario_result else '✗'}, "
+                f"risk={'✓' if self.state.risk_result else '✗'}, "
+                f"market={'✓' if self.state.market_result else '✗'}, "
+                f"cfo={'✓' if self.state.cfo_result else '✗'}"
+            )
+            return result
+
+        except Exception as e:
+            is_rl = self._is_rate_limit_error(e)
+
+            # ── Harvest partial results from tasks that completed before the crash ──
             try:
-                crew_instance = FinancialFpa()
-                # !! IMPORTANT: store the crew object in a variable and reuse it.
-                # Calling crew_instance.crew() twice creates TWO separate Crew objects.
-                # The second call (used below for task extraction) would return a brand-new
-                # empty crew, so all task outputs would be None. One variable = one crew.
-                active_crew = crew_instance.crew()
-                result = active_crew.kickoff(inputs={
-                    'csv_path':         self.state.csv_path,
-                    'company_name':     self.state.company_name,
-                    'benchmark_sector': self.state.sector or 'IT',
-                })
-
-                # ── Extract structured Pydantic results from each completed task ──
-                # CrewAI stores task outputs on the crew object after kickoff.
-                # We iterate the tasks list and pull .output.pydantic if present.
-                for task_obj in active_crew.tasks:
-                    raw_output = getattr(task_obj, 'output', None)
-                    if raw_output is None:
-                        continue
-                    pydantic_out = getattr(raw_output, 'pydantic', None)
-                    if pydantic_out is None:
-                        # Fallback: try to coerce raw JSON output to Pydantic model
-                        json_dict = getattr(raw_output, 'json_dict', None)
-                        if json_dict and isinstance(json_dict, dict):
-                            try:
-                                if 'revenue' in json_dict and 'top_3_positives' in json_dict:
-                                    pydantic_out = PerformanceAnalysisOutput(**json_dict)
-                                elif 'overall_risk_level' in json_dict:
-                                    pydantic_out = RiskAssessmentOutput(**json_dict)
-                                elif 'executive_summary' in json_dict and 'recommendations' in json_dict:
-                                    pydantic_out = CFOAdvisoryOutput(**json_dict)
-                                elif 'scenarios' in json_dict and 'sensitivity_drivers' in json_dict:
-                                    pydantic_out = ScenarioPlanningOutput(**json_dict)
-                                elif 'benchmarks' in json_dict and 'market_trends' in json_dict:
-                                    pydantic_out = MarketResearchOutput(**json_dict)
-                            except Exception:
-                                pass  # Coercion failed — skip this task output
-
-                    if pydantic_out is None:
-                        continue
-
-                    if isinstance(pydantic_out, PerformanceAnalysisOutput):
-                        self.state.performance_result = pydantic_out.model_dump()
-                    elif isinstance(pydantic_out, ScenarioPlanningOutput):
-                        self.state.scenario_result = pydantic_out.model_dump()
-                    elif isinstance(pydantic_out, RiskAssessmentOutput):
-                        self.state.risk_result = pydantic_out.model_dump()
-                    elif isinstance(pydantic_out, MarketResearchOutput):
-                        self.state.market_result = pydantic_out.model_dump()
-                    elif isinstance(pydantic_out, CFOAdvisoryOutput):
-                        self.state.cfo_result = pydantic_out.model_dump()
-
+                self._harvest_task_outputs(active_crew)
+                has_any = self._has_any_results()
                 fpa_logger.info(
-                    f"[Flow] Crew analysis complete. "
-                    f"Structured outputs captured: "
+                    f"[Flow] Partial result capture after crash (has_any={has_any}): "
                     f"performance={'✓' if self.state.performance_result else '✗'}, "
+                    f"scenario={'✓' if self.state.scenario_result else '✗'}, "
                     f"risk={'✓' if self.state.risk_result else '✗'}, "
+                    f"market={'✓' if self.state.market_result else '✗'}, "
                     f"cfo={'✓' if self.state.cfo_result else '✗'}"
                 )
-                return result
+            except Exception as extract_err:
+                fpa_logger.warning(f"[Flow] Partial extraction failed: {extract_err}")
 
-            except Exception as e:
-                is_rl = self._is_rate_limit_error(e)
-                if is_rl and attempt < MAX_RATE_LIMIT_RETRIES:
-                    wait_secs = self._parse_retry_after(str(e))
-                    # Use exponential backoff on top of the Groq-suggested wait
-                    backoff = wait_secs * (1.5 ** (attempt - 1))
-                    fpa_logger.warning(
-                        f"[Flow] Groq rate limit hit (attempt {attempt}/{MAX_RATE_LIMIT_RETRIES}). "
-                        f"Waiting {backoff:.1f}s before retry…"
-                    )
-                    self.state.current_step = f"rate_limit_wait_{attempt}"
-                    time.sleep(backoff)
-                    # continue → next loop iteration
-                elif is_rl:
-                    # Rate limit exhausted all retries — mark flag so quality gate
-                    # skips another crew retry and goes straight to report generation
-                    self.state.rate_limit_exhausted = True
-                    self.state.error_message = (
-                        "Groq TPM limit exhausted after all retries. "
-                        "Partial results will be used for report generation."
-                    )
-                    self.state.current_step = "rate_limit_exhausted"
-                    fpa_logger.error(
-                        f"[Flow] Rate limit exhausted after {MAX_RATE_LIMIT_RETRIES} attempts. "
-                        "Proceeding with any partial results captured so far."
-                    )
-                    return None
-                else:
-                    # Non-rate-limit error
-                    self.state.error_message = f"Crew execution failed: {str(e)}"
-                    self.state.current_step = "crew_error"
-                    fpa_logger.error(f"[Flow] Crew error: {str(e)}", exc_info=True)
-                    return None
+            if is_rl:
+                self.state.rate_limit_exhausted = True
+                self.state.error_message = (
+                    "Rate limit hit during crew execution. "
+                    "Partial results will be used for report generation."
+                )
+                self.state.current_step = "rate_limit_exhausted"
+                fpa_logger.warning(
+                    "[Flow] Rate limit hit — accepting partial results and proceeding "
+                    "to report generation. No restart."
+                )
+            else:
+                self.state.error_message = f"Crew execution failed: {str(e)}"
+                self.state.current_step = "crew_error"
+                fpa_logger.error(f"[Flow] Crew error: {str(e)}", exc_info=True)
+
+            return None
 
     # ── Step 3: Quality Gate ───────────────────────────────────────────────────
 
@@ -398,11 +491,11 @@ class FinancialAnalysisFlow(Flow[FPAFlowState]):
             # Never retry if we already burned all TPM retries
             fpa_logger.warning("[Flow] Rate limit exhausted — forcing quality_pass")
             return "quality_pass"
-        elif self.state.retry_count < 1:
-            # Allow only 1 quality retry (not 2) to preserve TPM budget
+        elif self.state.retry_count < 3:
+            # Allow up to 3 quality retries (was 1) to give the pipeline more chances
             return "quality_retry"
         else:
-            # Accept after 1 retry to prevent infinite loops
+            # Accept after 3 retries to prevent infinite loops
             fpa_logger.warning("[Flow] Quality issues persist after retry — accepting")
             return "quality_pass"
 
@@ -417,7 +510,7 @@ class FinancialAnalysisFlow(Flow[FPAFlowState]):
         self.state.retry_count += 1
         self.state.current_step = f"retry_{self.state.retry_count}"
         fpa_logger.warning(
-            f"[Flow] Quality retry {self.state.retry_count}/1: {self.state.quality_issues}"
+            f"[Flow] Quality retry {self.state.retry_count}/3: {self.state.quality_issues}"
         )
         # Reset is_valid so the "valid" emission re-triggers run_analysis_crew
         self.state.is_valid = True

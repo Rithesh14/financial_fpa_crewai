@@ -20,7 +20,7 @@ performance_analysis_task:
     Analyze {company_name} using the dataset at {csv_path}.
 
     Call fpa_analysis_tool with EXACTLY these string arguments:
-      csv_path="{csv_path}", company="{company_name}", sector="IT"
+      csv_path="{csv_path}", company="{company_name}", sector="{benchmark_sector}"
     Do NOT use any other csv_path value — do not guess or invent filenames.
 
     Then call:

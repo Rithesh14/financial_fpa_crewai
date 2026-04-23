@@ -13,13 +13,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from dotenv import load_dotenv
 load_dotenv()
 
-# Force Groq config if not already set
-if not os.getenv('OPENAI_API_BASE'):
-    os.environ['OPENAI_API_BASE'] = 'https://api.groq.com/openai/v1'
-if not os.getenv('OPENAI_MODEL_NAME'):
-    os.environ['OPENAI_MODEL_NAME'] = 'llama-3.1-8b-instant'
-if not os.getenv('OPENAI_API_KEY') and os.getenv('GROQ_API_KEY'):
-    os.environ['OPENAI_API_KEY'] = os.getenv('GROQ_API_KEY')
+# Force Gemini config if not already set
+if not os.getenv('GEMINI_API_KEY') and os.getenv('OPENAI_API_KEY'):
+    os.environ['GEMINI_API_KEY'] = os.getenv('OPENAI_API_KEY')
 
 
 def main():

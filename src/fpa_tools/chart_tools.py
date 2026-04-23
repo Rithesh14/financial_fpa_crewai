@@ -33,9 +33,22 @@ COLORS = {
 }
 
 
-def ensure_chart_dir():
-    """Ensure charts directory exists."""
+def ensure_chart_dir(output_path: str = "charts/placeholder") -> str:
+    """
+    Ensure charts directory AND the parent of output_path both exist.
+    If output_path is an absolute path, redirect it into the local charts/ directory
+    so chart files are always written where Streamlit expects them.
+
+    Returns the (possibly normalised) output_path that callers should use.
+    """
     os.makedirs("charts", exist_ok=True)
+    # Redirect absolute paths → charts/basename  (Errors 1 & 6 fix)
+    if os.path.isabs(output_path):
+        output_path = os.path.join("charts", os.path.basename(output_path))
+    parent = os.path.dirname(output_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return output_path
 
 
 def _load_company_data(csv_path: str, company: Optional[str]) -> pd.DataFrame:
@@ -72,7 +85,7 @@ def generate_revenue_trend_chart(
     Returns:
         dict with chart_path, insights, and status
     """
-    ensure_chart_dir()
+    output_path = ensure_chart_dir(output_path)
     df = _load_company_data(csv_path, company or None)
 
     if df.empty:
@@ -149,7 +162,7 @@ def generate_scenario_comparison_chart(
     Returns:
         dict with chart_path, insights, and status
     """
-    ensure_chart_dir()
+    output_path = ensure_chart_dir(output_path)
     df = _load_company_data(csv_path, company or None)
 
     if df.empty:
@@ -226,7 +239,7 @@ def generate_risk_dashboard(
     Returns:
         dict with chart_path, insights, and status
     """
-    ensure_chart_dir()
+    output_path = ensure_chart_dir(output_path)
     df = _load_company_data(csv_path, company or None)
 
     if df.empty:
@@ -312,7 +325,7 @@ def generate_profitability_analysis_chart(
     Returns:
         dict with chart_path, insights, and status
     """
-    ensure_chart_dir()
+    output_path = ensure_chart_dir(output_path)
     df = _load_company_data(csv_path, company or None)
 
     if df.empty:
@@ -383,7 +396,7 @@ def generate_waterfall_chart(
     Returns:
         dict with chart_path, insights, and status
     """
-    ensure_chart_dir()
+    output_path = ensure_chart_dir(output_path)
     df = _load_company_data(csv_path, company or None)
 
     if df.empty or len(df) < 2:
@@ -471,7 +484,7 @@ def generate_radar_chart(
     Returns:
         dict with chart_path, insights, and status
     """
-    ensure_chart_dir()
+    output_path = ensure_chart_dir(output_path)
     df = _load_company_data(csv_path, company or None)
 
     if df.empty:
@@ -559,7 +572,7 @@ def generate_metrics_heatmap(
     Returns:
         dict with chart_path, insights, and status
     """
-    ensure_chart_dir()
+    output_path = ensure_chart_dir(output_path)
     df = _load_company_data(csv_path, company or None)
 
     if df.empty:
