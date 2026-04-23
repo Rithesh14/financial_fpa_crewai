@@ -74,7 +74,11 @@ streamlit run streamlit_app.py
 ### Steps to Run an Analysis:
 1. Navigate to the **Upload & Configure** tab.
 2. Upload your financial CSV dataset. 
-   *(Required columns: `Period`, `Company`, `Revenue`, `EBITDA`, `Operating_Cash_Flow`, `Debt/Equity Ratio`, `Current Ratio`)*
+   > **⚠️ Important Data Constraint:** The uploaded CSV file **must** strictly follow the structure and formatting of the built-in demo dataset (`src/data/modified_financial_data.csv`). 
+   > 
+   > **Required Columns Include:** `Period`, `Company`, `Category`, `Market_Cap`, `Revenue`, `Gross Profit`, `Net Income`, `Earning Per Share`, `EBITDA`, `Share Holder Equity`, `Operating_Cash_Flow`, `Investing_Cash_Flow`, `Financing_Cash_Flow`, `Current Ratio`, `Debt/Equity Ratio`, `ROE`, `ROA`, `ROI`, `Net Profit Margin`, `Free Cash Flow per Share`, `Return on Tangible Equity`, `Employees`, `Inflation`, `Revenue_Growth`, `Net_Income_Growth`, `EBITDA_Margin`, `Net_Cash_Flow`, `Revenue_per_Employee`, `High_Leverage_Risk`, `Liquidity_Risk`.
+   > 
+   > Ensure your column names exactly match and data types are consistent.
    > **Note:** A built-in demo dataset is available to test the application immediately.
 3. Select the target **Company** and **Industry Sector**.
 4. Click **Run Analysis** to execute the pipeline.
