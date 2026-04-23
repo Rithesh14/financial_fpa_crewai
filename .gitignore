@@ -8,9 +8,7 @@ __pycache__/
 *.pyd
 .Python
 
-# Generated outputs (recreated at runtime)
-charts/*.png
-reports/*.pdf
+# Logs only (charts and reports are committed for GitHub README showcase)
 logs/*.log
 
 # CrewAI memory/state databases
