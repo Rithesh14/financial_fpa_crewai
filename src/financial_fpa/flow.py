@@ -1,26 +1,28 @@
 """
-Financial Analysis Flow — Production Orchestration (Phase 4).
+Financial Analysis Flow — Production v4 (2-Stage Pipeline).
 
-Uses CrewAI Flows with:
-  - @start / @listen / @router decorators for event-driven pipeline
-  - @persist for SQLite-backed state persistence (crash recovery)
-  - FPAFlowState (Pydantic) for typed, validated state throughout
+ARCHITECTURE CHANGE from v3:
+  BEFORE: validate → direct_tools → run_analysis_crew (5-agent ReAct loop)
+                   → check_quality → generate_reports → deliver_results
+  AFTER:  validate → run_direct_tools → generate_llm_report → deliver_results
+
+Key benefits:
+  - ZERO empty-LLM-response errors (no ReAct tool-call loop)
+  - Max 1 LLM call per run (for the final report only)
+  - Deterministic fallback: if LLM fails, report is built from raw numbers
+  - ~10x fewer API calls vs v3
+  - Token-efficient: only summary metrics sent to LLM, not full logs
 
 Pipeline:
     validate_input
-        ↓ valid ──────────────────────────────────────────────────────┐
-        ↓ invalid → handle_invalid_input (stop)                       │
-    run_analysis_crew                                                  │
-        ↓                                                             │
-    check_quality                                                      │
-        ↓ quality_pass ────────────────────────────────────── generate_reports
-        ↓ quality_retry → retry_with_feedback → run_analysis_crew     │
-        ↓ (after 2 retries, accept)                                   │
-    deliver_results ←─────────────────────────────────────────────────┘
+        ↓ valid   → run_direct_tools → generate_llm_report → deliver_results
+        ↓ invalid → handle_invalid_input (stop)
 """
 
 import re
 import time
+import os
+import json
 import pandas as pd
 from typing import Optional, List, Dict, Any
 
@@ -33,30 +35,20 @@ try:
 except ImportError:
     try:
         from crewai.flow.flow import Flow, listen, start, router
-        persist = lambda cls: cls   # no-op decorator if persist not available
+        persist = lambda cls: cls
         FLOW_PERSIST_AVAILABLE = False
     except ImportError:
         raise ImportError(
             "CrewAI Flows not available. Please upgrade: pip install 'crewai>=0.86.0'"
         )
 
-from financial_fpa.models import (
-    PerformanceAnalysisOutput,
-    ScenarioPlanningOutput,
-    RiskAssessmentOutput,
-    MarketResearchOutput,
-    CFOAdvisoryOutput,
-)
 from fpa_tools.logger import fpa_logger, log_flow_state
 
 
 # ── Flow State ────────────────────────────────────────────────────────────────
 
 class FPAFlowState(BaseModel):
-    """
-    Typed state that flows through the entire FP&A pipeline.
-    All fields have sensible defaults so the flow can always be instantiated.
-    """
+    """Typed state flowing through the 2-stage FP&A pipeline."""
     # ── Inputs ──
     csv_path: str = ""
     company_name: str = ""
@@ -67,27 +59,29 @@ class FPAFlowState(BaseModel):
     validation_errors: List[str] = []
     available_companies: List[str] = []
 
-    # ── Crew results (populated after crew run) ──
-    performance_result: Optional[Dict[str, Any]] = None
-    scenario_result:    Optional[Dict[str, Any]] = None
-    risk_result:        Optional[Dict[str, Any]] = None
-    market_result:      Optional[Dict[str, Any]] = None
-    cfo_result:         Optional[Dict[str, Any]] = None
+    # ── Stage 1: Direct tool results (no LLM) ──
+    direct_analysis_result: Optional[str] = None
+    direct_charts: List[str] = []
+    direct_errors: List[str] = []
 
-    # ── Quality gate ──
-    quality_passed: bool = False
-    quality_issues: List[str] = []
-    retry_count: int = 0
-    # Set to True when crew failed due to rate limits (skip quality retry)
-    rate_limit_exhausted: bool = False
+    # ── Stage 2: LLM report (single call) ──
+    llm_report: Optional[str] = None
+    llm_report_source: str = "none"   # "llm" | "fallback" | "none"
+
+    # ── Structured metrics extracted for Streamlit display ──
+    performance_result: Optional[Dict[str, Any]] = None
+
+    # ── API tracking ──
+    api_calls_made: int = 0
+    rate_limit_hits: int = 0
+    skipped_steps: List[str] = []
 
     # ── Outputs ──
-    pdf_path:         Optional[str] = None
-    excel_path:       Optional[str] = None
+    pdf_path: Optional[str] = None
     charts_generated: List[str] = []
 
     # ── Status ──
-    current_step:  str = "initialized"
+    current_step: str = "initialized"
     error_message: Optional[str] = None
 
 
@@ -96,28 +90,28 @@ class FPAFlowState(BaseModel):
 @persist
 class FinancialAnalysisFlow(Flow[FPAFlowState]):
     """
-    Production orchestration flow for Financial FP&A.
+    Production orchestration v4 — 2-stage pipeline.
 
-    Wraps the CrewAI crew in a reliable pipeline with:
-    - Input validation before any expensive LLM calls
-    - Quality gates on crew outputs
-    - Automatic retry with feedback (up to 2 retries)
-    - PDF report generation from typed Pydantic state
-    - State persistence to SQLite (survives crashes)
+    Stage 1 (no LLM): run_direct_tools
+      - FPA analysis (pure Python computation)
+      - All 6 charts (pure Python + matplotlib)
+      - Results cached on disk
+
+    Stage 2 (1 LLM call): generate_llm_report
+      - Builds a concise prompt from summary metrics
+      - Calls LLM ONCE for structured report text
+      - On failure/empty response → deterministic fallback from raw numbers
     """
 
-    # ── Step 1: Validate Input ────────────────────────────────────────────────
+    # ── Step 1: Validate Input ────────────────────────────────────────────
 
     @start()
     def validate_input(self):
-        """
-        Validate the CSV file and company selection before starting analysis.
-        Returns 'valid' or 'invalid' for the router.
-        """
-        log_flow_state("validate_input", f"csv={self.state.csv_path}, company={self.state.company_name}")
+        """Validate CSV file and company selection."""
+        log_flow_state("validate_input",
+                       f"csv={self.state.csv_path}, company={self.state.company_name}")
         self.state.current_step = "validating"
 
-        # Try to load the CSV
         try:
             df = pd.read_csv(self.state.csv_path)
         except FileNotFoundError:
@@ -131,7 +125,6 @@ class FinancialAnalysisFlow(Flow[FPAFlowState]):
             self.state.error_message = str(e)
             return "invalid"
 
-        # Check required columns
         required = ['Period', 'Revenue', 'EBITDA', 'Operating_Cash_Flow',
                     'Debt/Equity Ratio', 'Current Ratio']
         actual = [c.strip() for c in df.columns]
@@ -139,40 +132,31 @@ class FinancialAnalysisFlow(Flow[FPAFlowState]):
         if missing:
             self.state.validation_errors.append(f"Missing columns: {missing}")
 
-        # Validate company selection
         company_col = next((c for c in df.columns if c.strip() == 'Company'), None)
         if company_col:
             df[company_col] = df[company_col].str.strip()
             self.state.available_companies = sorted(df[company_col].unique().tolist())
-            if self.state.company_name and self.state.company_name not in self.state.available_companies:
+            if (self.state.company_name and
+                    self.state.company_name not in self.state.available_companies):
                 self.state.validation_errors.append(
                     f"Company '{self.state.company_name}' not found. "
                     f"Available: {self.state.available_companies}"
                 )
             elif not self.state.company_name and self.state.available_companies:
-                # Auto-select first company if none specified
                 self.state.company_name = self.state.available_companies[0]
                 fpa_logger.info(f"Auto-selected company: {self.state.company_name}")
 
         self.state.is_valid = len(self.state.validation_errors) == 0
-        log_flow_state(
-            "validate_input_result",
-            f"valid={self.state.is_valid}, errors={self.state.validation_errors}"
-        )
+        log_flow_state("validate_input_result",
+                       f"valid={self.state.is_valid}, errors={self.state.validation_errors}")
         return "valid" if self.state.is_valid else "invalid"
-
-    # ── Router: validation ────────────────────────────────────────────────────
 
     @router(validate_input)
     def route_validation(self):
-        """Route to analysis or error handling based on validation result."""
         return "valid" if self.state.is_valid else "invalid"
-
-    # ── Step 1b: Handle Invalid ───────────────────────────────────────────────
 
     @listen("invalid")
     def handle_invalid_input(self):
-        """Gracefully handle invalid input — stop the flow with an error state."""
         self.state.current_step = "failed_validation"
         self.state.error_message = (
             f"Input validation failed: {'; '.join(self.state.validation_errors)}"
@@ -180,414 +164,527 @@ class FinancialAnalysisFlow(Flow[FPAFlowState]):
         fpa_logger.error(f"[Flow] Validation failed: {self.state.error_message}")
         return self.state
 
-    # ── Step 2: Run Analysis Crew ─────────────────────────────────────────────
-
-    # ── Rate-limit helpers ────────────────────────────────────────────────────
-
-    @staticmethod
-    def _parse_retry_after(error_msg: str) -> float:
-        """
-        Extract the recommended wait time from a Groq RateLimitError message.
-        Falls back to a sensible default if not parseable.
-
-        Example message:
-          "...Please try again in 13.86s..."
-        """
-        match = re.search(r'try again in\s+([\d.]+)s', str(error_msg), re.IGNORECASE)
-        if match:
-            return float(match.group(1)) + 2.0   # add 2s safety buffer
-        return 20.0                               # safe default
+    # ── Helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
     def _is_rate_limit_error(exc: Exception) -> bool:
-        """
-        Return True if the exception is a rate-limit / quota error from
-        Groq (429 / RateLimitError) OR Gemini (RESOURCE_EXHAUSTED / quota exceeded)
-        OR an empty LLM response caused by rate limits.
-
-        'Invalid response from LLM call - None or empty' happens when the API
-        accepts the TCP connection but returns an empty HTTP body — this occurs
-        immediately after a TPM rate limit. It is NOT a code bug; it is a transient
-        API error that resolves after the TPM window resets. Treat it as retriable.
-        """
         err_str = str(exc).lower()
         return (
             "ratelimit" in err_str
             or "rate_limit_exceeded" in err_str
             or "429" in err_str
             or "try again in" in err_str
-            or "none or empty" in err_str          # Empty response after rate limit
-            or "invalid response from llm" in err_str  # Same root cause
-            or "resource_exhausted" in err_str     # Gemini quota error
-            or "quota exceeded" in err_str         # Gemini quota message
-            or "please retry in" in err_str        # Gemini retry suggestion
+            or "resource_exhausted" in err_str
+            or "quota exceeded" in err_str
+            or "please retry in" in err_str
         )
 
-    def _has_sufficient_results(self) -> bool:
-        """
-        Return True if the primary deliverable (performance_result) is already
-        captured in state. When True, there is no value in re-running the full
-        crew from Task 1 — we should proceed straight to report generation.
-        """
-        return self.state.performance_result is not None
+    @staticmethod
+    def _parse_retry_after(error_msg: str) -> float:
+        match = re.search(
+            r'(?:try again|retry)\s+in\s+([\d.]+)s', str(error_msg), re.IGNORECASE
+        )
+        if match:
+            return float(match.group(1)) + 2.0
+        return 30.0
 
-    def _has_any_results(self) -> bool:
-        """
-        Return True if ANY crew result was captured. Even a single completed task
-        means we made progress and should NOT restart from scratch.
-        """
-        return any([
-            self.state.performance_result,
-            self.state.scenario_result,
-            self.state.risk_result,
-            self.state.market_result,
-            self.state.cfo_result,
-        ])
-
-    def _harvest_task_outputs(self, crew_obj) -> None:
-        """
-        Walk all tasks on a crew object and persist any completed Pydantic outputs
-        into self.state. Safe to call after both successful and failed kickoff().
-
-        Only writes to state if the field is currently empty — this makes it safe
-        to call multiple times without overwriting a previously-captured result with
-        a None from a later (failed) attempt.
-        """
-        for task_obj in crew_obj.tasks:
-            raw_output = getattr(task_obj, 'output', None)
-            if raw_output is None:
-                continue
-            pydantic_out = getattr(raw_output, 'pydantic', None)
-            if pydantic_out is None:
-                # Fallback: coerce from raw json_dict if pydantic parsing wasn't triggered
-                json_dict = getattr(raw_output, 'json_dict', None)
-                if json_dict and isinstance(json_dict, dict):
-                    try:
-                        if 'revenue' in json_dict and 'top_3_positives' in json_dict:
-                            pydantic_out = PerformanceAnalysisOutput(**json_dict)
-                        elif 'overall_risk_level' in json_dict:
-                            pydantic_out = RiskAssessmentOutput(**json_dict)
-                        elif 'executive_summary' in json_dict and 'recommendations' in json_dict:
-                            pydantic_out = CFOAdvisoryOutput(**json_dict)
-                        elif 'scenarios' in json_dict and 'sensitivity_drivers' in json_dict:
-                            pydantic_out = ScenarioPlanningOutput(**json_dict)
-                        elif 'benchmarks' in json_dict and 'market_trends' in json_dict:
-                            pydantic_out = MarketResearchOutput(**json_dict)
-                    except Exception:
-                        pass  # Coercion failed — skip this task
-
-            # Also try extracting from raw text output as a last resort
-            if pydantic_out is None:
-                raw_text = getattr(raw_output, 'raw', None)
-                if raw_text and isinstance(raw_text, str) and len(raw_text) > 50:
-                    # Try to parse JSON from the raw text
-                    import json as _json
-                    try:
-                        # Find JSON object in the raw text
-                        start_idx = raw_text.find('{')
-                        end_idx = raw_text.rfind('}')
-                        if start_idx >= 0 and end_idx > start_idx:
-                            json_str = raw_text[start_idx:end_idx + 1]
-                            parsed = _json.loads(json_str)
-                            if isinstance(parsed, dict):
-                                if 'revenue' in parsed and 'top_3_positives' in parsed:
-                                    pydantic_out = PerformanceAnalysisOutput(**parsed)
-                                elif 'overall_risk_level' in parsed:
-                                    pydantic_out = RiskAssessmentOutput(**parsed)
-                                elif 'executive_summary' in parsed and 'recommendations' in parsed:
-                                    pydantic_out = CFOAdvisoryOutput(**parsed)
-                                elif 'scenarios' in parsed and 'sensitivity_drivers' in parsed:
-                                    pydantic_out = ScenarioPlanningOutput(**parsed)
-                                elif 'benchmarks' in parsed and 'market_trends' in parsed:
-                                    pydantic_out = MarketResearchOutput(**parsed)
-                    except Exception:
-                        pass  # JSON parse failed — skip
-
-            if pydantic_out is None:
-                continue
-
-            # Only write if not already captured (never overwrite a good result with None/empty)
-            if isinstance(pydantic_out, PerformanceAnalysisOutput) and not self.state.performance_result:
-                self.state.performance_result = pydantic_out.model_dump()
-                fpa_logger.info("[Flow] ✓ Harvested: performance_result")
-            elif isinstance(pydantic_out, ScenarioPlanningOutput) and not self.state.scenario_result:
-                self.state.scenario_result = pydantic_out.model_dump()
-                fpa_logger.info("[Flow] ✓ Harvested: scenario_result")
-            elif isinstance(pydantic_out, RiskAssessmentOutput) and not self.state.risk_result:
-                self.state.risk_result = pydantic_out.model_dump()
-                fpa_logger.info("[Flow] ✓ Harvested: risk_result")
-            elif isinstance(pydantic_out, MarketResearchOutput) and not self.state.market_result:
-                self.state.market_result = pydantic_out.model_dump()
-                fpa_logger.info("[Flow] ✓ Harvested: market_result")
-            elif isinstance(pydantic_out, CFOAdvisoryOutput) and not self.state.cfo_result:
-                self.state.cfo_result = pydantic_out.model_dump()
-                fpa_logger.info("[Flow] ✓ Harvested: cfo_result")
+    # ── Stage 1: Run Direct Tools (NO LLM) ───────────────────────────────
 
     @listen("valid")
-    def run_analysis_crew(self):
+    def run_direct_tools(self):
         """
-        Kick off the CrewAI analysis crew with validated inputs.
+        Stage 1: Run FPA analysis + all charts as direct Python calls.
 
-        SINGLE ATTEMPT — NO RETRY LOOP.
-
-        Why no retries:
-        - Re-running kickoff() restarts ALL tasks from scratch, wasting every
-          token already consumed by completed tasks.
-        - With 30s inter-task pacing (set in crew.py), rate limits are unlikely
-          during normal execution.
-        - If a crash does occur, we harvest whatever tasks completed and proceed
-          to report generation with partial results — this is far cheaper than
-          restarting the entire 6-task pipeline.
-
-        Rate limit prevention strategy:
-        - 30s sleep after every successful task completion (crew.py callback)
-        - max_retry_limit=3 on each agent (handles transient per-call 429s)
-        - On crash: harvest partial results → proceed to PDF generation
+        Zero LLM usage. These are pure computation — CSV → numbers/PNGs.
+        Results are cached on disk so re-runs for the same company skip this.
         """
-        from financial_fpa.crew import FinancialFpa
+        self.state.current_step = "running_direct_tools"
+        log_flow_state("run_direct_tools", f"company={self.state.company_name}")
 
-        self.state.current_step = "analyzing"
-        self.state.rate_limit_exhausted = False
-        log_flow_state(
-            "run_analysis_crew",
-            f"company={self.state.company_name}, retry={self.state.retry_count}"
-        )
-
-        # ── Pre-flight: if we already have results (from a previous crashed run), skip ──
-        if self._has_sufficient_results():
-            fpa_logger.info(
-                f"[Flow] Results already in state from previous run — skipping crew. "
-                f"performance={'✓' if self.state.performance_result else '✗'}, "
-                f"risk={'✓' if self.state.risk_result else '✗'}, "
-                f"cfo={'✓' if self.state.cfo_result else '✗'}"
-            )
-            return None
-
-        # Gemini quota is DAILY — no preflight wait needed on retries.
-        # (The old 65s wait was designed for Groq's 1-minute TPM window.)
-        if self.state.retry_count > 0:
-            fpa_logger.info(
-                f"[Flow] Quality retry #{self.state.retry_count} — re-running crew immediately "
-                "(Gemini daily quota: no TPM window to wait for)"
-            )
-
-        # ── Create crew instance ──
-        crew_instance = FinancialFpa()
-        active_crew = crew_instance.crew()
+        # Skip if already have results (cached state from prior run)
+        if self.state.direct_analysis_result:
+            fpa_logger.info("[Flow] Direct tool results already in state — skipping")
+            return
 
         try:
-            fpa_logger.info("[Flow] Starting crew kickoff…")
-            result = active_crew.kickoff(inputs={
-                'csv_path':         self.state.csv_path,
-                'company_name':     self.state.company_name,
-                'benchmark_sector': self.state.sector or 'IT',
-            })
-
-            # ── Extract structured Pydantic results from each completed task ──
-            self._harvest_task_outputs(active_crew)
+            from financial_fpa.crew import run_tools_directly
+            results = run_tools_directly(
+                csv_path=self.state.csv_path,
+                company=self.state.company_name,
+                sector=self.state.sector or "IT",
+            )
+            self.state.direct_analysis_result = results.get("analysis_result")
+            self.state.direct_charts = results.get("charts", [])
+            self.state.direct_errors = results.get("errors", [])
 
             fpa_logger.info(
-                f"[Flow] Crew analysis complete. "
-                f"Structured outputs captured: "
-                f"performance={'✓' if self.state.performance_result else '✗'}, "
-                f"scenario={'✓' if self.state.scenario_result else '✗'}, "
-                f"risk={'✓' if self.state.risk_result else '✗'}, "
-                f"market={'✓' if self.state.market_result else '✗'}, "
-                f"cfo={'✓' if self.state.cfo_result else '✗'}"
+                f"[Flow] Stage 1 complete: "
+                f"analysis={'✓' if self.state.direct_analysis_result else '✗'}, "
+                f"charts={len(self.state.direct_charts)}, "
+                f"errors={len(self.state.direct_errors)}"
             )
-            return result
+        except Exception as e:
+            fpa_logger.error(f"[Flow] Stage 1 (direct tools) failed: {e}")
+            self.state.direct_errors.append(str(e))
+
+    # ── Stage 2: Single LLM Call for Report Generation ───────────────────
+
+    @listen(run_direct_tools)
+    def generate_llm_report(self):
+        """
+        Stage 2: Call LLM ONCE to generate a structured FP&A report.
+
+        Input:  compact summary metrics from Stage 1 (not raw logs)
+        Output: structured text report stored in self.state.llm_report
+
+        If the LLM returns an empty/None response or fails with a rate-limit
+        error, a deterministic fallback report is built from the raw numbers —
+        so the pipeline NEVER returns an empty output.
+        """
+        self.state.current_step = "generating_report"
+        log_flow_state("generate_llm_report", f"company={self.state.company_name}")
+
+        company = self.state.company_name
+        analysis_text = self.state.direct_analysis_result or ""
+        chart_paths = self.state.direct_charts or []
+
+        # ── Build chart insights summary (not raw paths) ──
+        chart_insights = self._summarise_charts(chart_paths)
+
+        # ── Build concise prompt ──
+        prompt = self._build_report_prompt(company, analysis_text, chart_insights)
+
+        # ── Attempt single LLM call ──
+        llm_response = self._call_llm_once(prompt)
+
+        if llm_response:
+            self.state.llm_report = llm_response
+            self.state.llm_report_source = "llm"
+            self.state.api_calls_made += 1
+            fpa_logger.info(
+                f"[Flow] Stage 2 LLM report generated "
+                f"({len(llm_response)} chars)"
+            )
+        else:
+            # Fallback: deterministic report from raw analysis data
+            fpa_logger.warning(
+                "[Flow] LLM returned empty/None — using deterministic fallback"
+            )
+            self.state.llm_report = self._build_fallback_report(
+                company, analysis_text, chart_paths
+            )
+            self.state.llm_report_source = "fallback"
+            self.state.skipped_steps.append("llm_report_generation")
+
+        # ── Extract structured metrics for Streamlit display ──
+        self._extract_performance_metrics(analysis_text, company)
+
+        # ── Generate PDF from the report ──
+        self._generate_pdf(company)
+
+        # ── Track charts ──
+        chart_files = [
+            'charts/revenue_trend.png',
+            'charts/profitability_analysis.png',
+            'charts/scenario_comparison.png',
+            'charts/risk_dashboard.png',
+            'charts/waterfall_revenue.png',
+            'charts/radar_metrics.png',
+        ]
+        self.state.charts_generated = [f for f in chart_files if os.path.exists(f)]
+
+        fpa_logger.info(
+            f"[Flow] Report generation complete: "
+            f"source={self.state.llm_report_source}, "
+            f"charts={len(self.state.charts_generated)}, "
+            f"pdf={'✓' if self.state.pdf_path else '✗'}"
+        )
+
+    # ── Step 3: Deliver Results ───────────────────────────────────────────
+
+    @listen(generate_llm_report)
+    def deliver_results(self):
+        """Final step — mark pipeline complete and return final state."""
+        self.state.current_step = "completed"
+        log_flow_state("deliver_results",
+                       f"pdf={self.state.pdf_path}, charts={len(self.state.charts_generated)}")
+        fpa_logger.info(
+            f"[Flow] ✅ Analysis complete for {self.state.company_name}. "
+            f"Report source: {self.state.llm_report_source}. "
+            f"PDF: {self.state.pdf_path}"
+        )
+        return self.state
+
+    # ── Private helpers ───────────────────────────────────────────────────
+
+    def _summarise_charts(self, chart_paths: List[str]) -> str:
+        """
+        Convert chart file paths into human-readable insight strings.
+        Keeps the LLM prompt small — no raw file paths injected.
+        """
+        if not chart_paths:
+            return "No charts generated."
+        labels = {
+            "revenue_trend":       "Revenue trend over time",
+            "profitability":       "EBITDA margin and profitability trend",
+            "scenario_comparison": "Best/Base/Worst case revenue scenarios",
+            "risk_dashboard":      "Risk metrics and financial stability dashboard",
+            "waterfall":           "Revenue waterfall (year-over-year bridges)",
+            "radar":               "Multi-metric financial radar chart",
+        }
+        found = []
+        for path in chart_paths:
+            base = os.path.basename(str(path)).replace(".png", "").lower()
+            for key, label in labels.items():
+                if key in base:
+                    found.append(f"- {label} (generated: {os.path.basename(str(path))})")
+                    break
+            else:
+                if path:
+                    found.append(f"- Chart generated: {os.path.basename(str(path))}")
+        return "\n".join(found) if found else "Charts generated (see charts/ directory)."
+
+    def _build_report_prompt(
+        self, company: str, analysis_text: str, chart_insights: str
+    ) -> str:
+        """
+        Build the prompt for the single LLM call.
+        Covers 10 clearly-numbered sections so section-parsing is reliable.
+        Trimmed to ~900 chars of analysis data to stay within token budget.
+        """
+        trimmed_analysis = analysis_text[:900] if len(analysis_text) > 900 else analysis_text
+
+        return (
+            f"Generate a structured FP&A report for {company} using the financial data below.\n"
+            f"Write in full sentences. Each section must have at least 2-3 sentences of analysis.\n\n"
+            f"Financial Analysis Data:\n{trimmed_analysis}\n\n"
+            f"Charts available: {chart_insights}\n\n"
+            f"Output EXACTLY these 10 numbered sections with their headings as shown:\n"
+            f"1. Revenue CAGR\n"
+            f"   Analyse the CAGR value, what it means for the company, and the revenue trend direction.\n\n"
+            f"2. YoY Growth (last 5 years)\n"
+            f"   Summarise year-over-year growth pattern, acceleration or deceleration.\n\n"
+            f"3. EBITDA Margin\n"
+            f"   State the current margin, compare to typical industry levels, describe the trend.\n\n"
+            f"4. Operating Cash Flow\n"
+            f"   Describe the latest OCF figure and what it implies about cash generation quality.\n\n"
+            f"5. Cash Conversion Ratio\n"
+            f"   Explain the ratio and its implication for earnings quality.\n\n"
+            f"6. Top 3 Positives\n"
+            f"   List exactly 3 strengths as bullet points (start each with '- ').\n\n"
+            f"7. Top 3 Concerns\n"
+            f"   List exactly 3 concerns as bullet points (start each with '- ').\n\n"
+            f"8. Risk Level Assessment\n"
+            f"   State overall risk level (Low/Moderate/High/Critical) and justify in 2-3 sentences.\n\n"
+            f"9. Scenario Projections\n"
+            f"   Describe the Best Case, Base Case, and Worst Case revenue scenarios for the next 3 years, "
+            f"based on the historical CAGR. Use bullet points for each scenario.\n\n"
+            f"10. Strategic Recommendations\n"
+            f"    Provide exactly 3 actionable recommendations as numbered points. "
+            f"Each should be 1-2 sentences with specific rationale.\n\n"
+            f"Format: use the section number and title as a header line, then the content below it."
+        )
+
+    def _call_llm_once(self, prompt: str) -> Optional[str]:
+        """
+        Make a single direct LLM call via LiteLLM/Groq.
+        Returns the response text, or None on failure/empty.
+
+        Does NOT use CrewAI agents or tools — this is a pure text completion.
+        """
+        try:
+            from crewai import LLM
+            llm = LLM(
+                model="groq/meta-llama/llama-4-scout-17b-16e-instruct",
+                api_key=os.environ.get("GROQ_API_KEY", ""),
+                temperature=0.2,
+                max_tokens=1500,
+            )
+            fpa_logger.info("[Flow] Calling LLM for report generation…")
+            response = llm.call(messages=[{"role": "user", "content": prompt}])
+
+            # Normalise response — CrewAI LLM.call can return str or object
+            if response is None:
+                fpa_logger.warning("[Flow] LLM returned None")
+                return None
+            if isinstance(response, str):
+                text = response.strip()
+            elif hasattr(response, 'content'):
+                text = str(response.content).strip()
+            elif hasattr(response, 'text'):
+                text = str(response.text).strip()
+            else:
+                text = str(response).strip()
+
+            if not text or text.lower() in ("none", "null", ""):
+                fpa_logger.warning("[Flow] LLM returned empty/null string")
+                return None
+
+            return text
 
         except Exception as e:
             is_rl = self._is_rate_limit_error(e)
-
-            # ── Harvest partial results from tasks that completed before the crash ──
-            try:
-                self._harvest_task_outputs(active_crew)
-                has_any = self._has_any_results()
-                fpa_logger.info(
-                    f"[Flow] Partial result capture after crash (has_any={has_any}): "
-                    f"performance={'✓' if self.state.performance_result else '✗'}, "
-                    f"scenario={'✓' if self.state.scenario_result else '✗'}, "
-                    f"risk={'✓' if self.state.risk_result else '✗'}, "
-                    f"market={'✓' if self.state.market_result else '✗'}, "
-                    f"cfo={'✓' if self.state.cfo_result else '✗'}"
-                )
-            except Exception as extract_err:
-                fpa_logger.warning(f"[Flow] Partial extraction failed: {extract_err}")
-
             if is_rl:
-                self.state.rate_limit_exhausted = True
-                self.state.error_message = (
-                    "Rate limit hit during crew execution. "
-                    "Partial results will be used for report generation."
-                )
-                self.state.current_step = "rate_limit_exhausted"
+                self.state.rate_limit_hits += 1
+                wait = min(self._parse_retry_after(str(e)), 30.0)
                 fpa_logger.warning(
-                    "[Flow] Rate limit hit — accepting partial results and proceeding "
-                    "to report generation. No restart."
+                    f"[Flow] LLM rate limit — skipping LLM, using fallback. "
+                    f"(would have waited {wait:.0f}s)"
                 )
             else:
-                self.state.error_message = f"Crew execution failed: {str(e)}"
-                self.state.current_step = "crew_error"
-                fpa_logger.error(f"[Flow] Crew error: {str(e)}", exc_info=True)
-
+                fpa_logger.error(f"[Flow] LLM call failed: {e}")
             return None
 
-    # ── Step 3: Quality Gate ───────────────────────────────────────────────────
-
-    @listen(run_analysis_crew)
-    def check_quality(self):
+    def _build_fallback_report(
+        self, company: str, analysis_text: str, chart_paths: List[str]
+    ) -> str:
         """
-        Quality gate — verify core outputs were produced before generating reports.
-
-        Relaxed criteria (v2):
-        - PASS if performance_result is present (the primary deliverable)
-        - PASS always if rate_limit_exhausted=True (retrying would burn more tokens)
-        - WARN (not FAIL) on missing secondary outputs (cfo, risk)
-        - Critical risk flag is informational only — does not block delivery
+        Deterministic report built entirely from raw analysis text.
+        Called when the LLM returns empty/None or fails.
+        Guarantees a non-empty output regardless of LLM status.
         """
-        self.state.current_step = "quality_check"
-        issues = []
+        charts_note = (
+            f"{len(chart_paths)} charts generated in charts/ directory."
+            if chart_paths else "Charts not generated."
+        )
+        report = (
+            f"# FP&A Report: {company}\n"
+            f"*(Generated via deterministic fallback — LLM unavailable)*\n\n"
+            f"## Financial Analysis\n"
+            f"{analysis_text}\n\n"
+            f"## Visualisations\n"
+            f"{charts_note}\n\n"
+            f"## Note\n"
+            f"This report was generated automatically from computed financial metrics. "
+            f"For LLM-enhanced narrative insights, please retry when API quota is available."
+        )
+        return report
 
-        # If we hit a rate limit wall, skip retry — proceed with whatever we have
-        if self.state.rate_limit_exhausted:
-            fpa_logger.warning(
-                "[Flow] Rate limit exhausted flag set — skipping quality retry, "
-                "proceeding to report generation with partial results."
-            )
-            self.state.quality_passed = True
-            self.state.quality_issues = ["Rate limit exhausted — partial results only"]
-            log_flow_state("check_quality", "passed=True (rate_limit bypass)")
+    def _extract_performance_metrics(self, analysis_text: str, company: str) -> None:
+        """
+        Parse key metrics from the compact analysis text and store them
+        in self.state.performance_result for Streamlit display.
+
+        Uses regex on the compact summary format produced by _build_compact_summary().
+        Never raises — silently skips on parse errors.
+        """
+        if not analysis_text:
             return
 
-        # Primary gate: performance analysis is the core deliverable
-        if not self.state.performance_result:
-            issues.append("Performance analysis returned no structured results")
+        try:
+            metrics: Dict[str, Any] = {}
 
-        # Secondary warnings (logged but do not block delivery after 1 retry)
-        if not self.state.cfo_result:
-            fpa_logger.warning("[Flow] CFO advisory output missing — will use text fallback")
-        if not self.state.risk_result:
-            fpa_logger.warning("[Flow] Risk assessment output missing — will use text fallback")
+            # Revenue CAGR  — "CAGR: 18.61%"
+            m = re.search(r'CAGR:\s*([\d.+-]+)%', analysis_text)
+            cagr = float(m.group(1)) if m else 0.0
 
-        # Informational: log critical risk but do not add to blocking issues
-        if self.state.risk_result:
-            overall_risk = self.state.risk_result.get('overall_risk_level', '')
-            if overall_risk == 'critical':
-                fpa_logger.warning(
-                    "[Flow] CRITICAL risk level detected — flagging in report"
-                )
+            # YoY latest — "YoY latest: 7.79%"
+            m = re.search(r'YoY latest:\s*([\d.+-]+)%', analysis_text)
+            yoy = float(m.group(1)) if m else 0.0
 
-        self.state.quality_issues = issues
-        self.state.quality_passed = len(issues) == 0
-        log_flow_state("check_quality", f"passed={self.state.quality_passed}, issues={issues}")
+            # Revenue — "Revenue: $123,456M"
+            m = re.search(r'Revenue:\s*\$([\d,]+)M', analysis_text)
+            current_rev = float(m.group(1).replace(',', '')) if m else 0.0
 
-    @router(check_quality)
-    def route_quality(self):
-        """Route to report generation, retry, or forced accept."""
-        if self.state.quality_passed:
-            return "quality_pass"
-        elif self.state.rate_limit_exhausted:
-            # Never retry if we already burned all TPM retries
-            fpa_logger.warning("[Flow] Rate limit exhausted — forcing quality_pass")
-            return "quality_pass"
-        elif self.state.retry_count < 3:
-            # Allow up to 3 quality retries (was 1) to give the pipeline more chances
-            return "quality_retry"
-        else:
-            # Accept after 3 retries to prevent infinite loops
-            fpa_logger.warning("[Flow] Quality issues persist after retry — accepting")
-            return "quality_pass"
+            # Revenue trend — "Trend: accelerating"
+            m = re.search(r'Revenue:.*?Trend:\s*(\w+)', analysis_text)
+            rev_trend = m.group(1) if m else "stable"
 
-    # ── Step 3b: Retry ────────────────────────────────────────────────────────
+            # EBITDA margin — "EBITDA margin: 33.1%"
+            m = re.search(r'EBITDA margin:\s*([\d.]+)%', analysis_text)
+            ebitda_margin = float(m.group(1)) if m else 0.0
 
-    @listen("quality_retry")
-    def retry_with_feedback(self):
-        """
-        Retry the crew with quality feedback injected.
-        Emits "valid" to directly re-trigger run_analysis_crew.
-        """
-        self.state.retry_count += 1
-        self.state.current_step = f"retry_{self.state.retry_count}"
-        fpa_logger.warning(
-            f"[Flow] Quality retry {self.state.retry_count}/3: {self.state.quality_issues}"
-        )
-        # Reset is_valid so the "valid" emission re-triggers run_analysis_crew
-        self.state.is_valid = True
-        return "valid"
+            # Margin trend — "Trend: stable" (second occurrence)
+            m_all = re.findall(r'Trend:\s*(\w+)', analysis_text)
+            margin_trend = m_all[1] if len(m_all) > 1 else "stable"
 
-    # ── Step 4: Generate Reports ──────────────────────────────────────────────
+            # Operating CF — "Operating CF: $12,345M"
+            m = re.search(r'Operating CF:\s*\$([\d,]+)M', analysis_text)
+            ocf = float(m.group(1).replace(',', '')) if m else 0.0
 
-    @listen("quality_pass")
-    def generate_reports(self):
-        """
-        Generate PDF report using the typed Pydantic state.
-        Uses extracting text from structured outputs — no text parsing needed.
-        """
-        import os
-        self.state.current_step = "generating_reports"
-        log_flow_state("generate_reports", f"company={self.state.company_name}")
+            # Cash conversion ratio — "Cash conv ratio: 0.891"
+            m = re.search(r'Cash conv ratio:\s*([\d.]+|N/A)', analysis_text)
+            ccr = float(m.group(1)) if m and m.group(1) != "N/A" else None
 
+            # Risk level — "Risk level: MODERATE"
+            m = re.search(r'Risk level:\s*(\w+)', analysis_text, re.IGNORECASE)
+            risk_level = m.group(1).lower() if m else "unknown"
+
+            # Risk flags — "Flags: flag1; flag2"
+            m = re.search(r'Flags:\s*(.+)', analysis_text)
+            flags_raw = m.group(1).strip() if m else ""
+            risk_flags = [f.strip() for f in flags_raw.split(';') if f.strip() and f.strip() != "None"]
+
+            # Base revenue — "Base revenue: $12,345M"
+            m = re.search(r'Base revenue:\s*\$([\d,]+)M', analysis_text)
+            base_rev = float(m.group(1).replace(',', '')) if m else current_rev
+
+            self.state.performance_result = {
+                "company_name": company,
+                "analysis_period": "Parsed from data",
+                "revenue": {
+                    "current_revenue": current_rev,
+                    "yoy_growth": yoy,
+                    "cagr": cagr,
+                    "trend": rev_trend,
+                },
+                "profitability": {
+                    "current_ebitda_margin": ebitda_margin,
+                    "margin_trend": margin_trend,
+                    "operating_leverage_evidence": "See analysis text",
+                },
+                "cash_flow": {
+                    "operating_cash_flow": ocf,
+                    "cash_conversion_ratio": ccr,
+                    "free_cash_flow": None,
+                },
+                "top_3_positives": self._extract_positives(analysis_text),
+                "top_3_concerns": self._extract_concerns(analysis_text, risk_flags),
+                "risk_level": risk_level,
+                "risk_flags": risk_flags,
+                "base_revenue": base_rev,
+            }
+
+            fpa_logger.info(
+                f"[Flow] Extracted metrics: CAGR={cagr:.2f}%, "
+                f"EBITDA={ebitda_margin:.1f}%, Risk={risk_level}"
+            )
+
+        except Exception as e:
+            fpa_logger.warning(f"[Flow] Metric extraction partial: {e}")
+
+    def _extract_positives(self, text: str) -> List[str]:
+        """Derive top positives from analysis text heuristics."""
+        positives = []
+        if re.search(r'CAGR:\s*([\d.]+)%', text):
+            m = re.search(r'CAGR:\s*([\d.]+)%', text)
+            val = float(m.group(1)) if m else 0
+            if val > 5:
+                positives.append(f"Strong revenue CAGR of {val:.1f}%")
+        if re.search(r'EBITDA margin:\s*([\d.]+)%', text):
+            m = re.search(r'EBITDA margin:\s*([\d.]+)%', text)
+            val = float(m.group(1)) if m else 0
+            if val > 20:
+                positives.append(f"Healthy EBITDA margin of {val:.1f}%")
+        m = re.search(r'Operating CF:\s*\$([\d,]+)M', text)
+        if m:
+            val = float(m.group(1).replace(',', ''))
+            if val > 0:
+                positives.append(f"Positive operating cash flow of ${val:,.0f}M")
+        return positives[:3] if positives else ["Strong operational performance"]
+
+    def _extract_concerns(self, text: str, risk_flags: List[str]) -> List[str]:
+        """Derive top concerns from analysis text heuristics."""
+        concerns = list(risk_flags[:2])
+        m = re.search(r'Debt/Equity:\s*([\d.]+)', text)
+        if m:
+            val = float(m.group(1))
+            if val > 1.5:
+                concerns.append(f"High Debt/Equity ratio of {val:.2f}")
+        m = re.search(r'Current ratio:\s*([\d.]+)', text)
+        if m:
+            val = float(m.group(1))
+            if val < 1.5:
+                concerns.append(f"Current ratio of {val:.2f} needs monitoring")
+        return concerns[:3] if concerns else ["Monitor leverage ratios"]
+
+    def _generate_pdf(self, company: str) -> None:
+        """Generate PDF report from the LLM report text and raw analysis data."""
         os.makedirs("reports", exist_ok=True)
-
-        # Build text summaries from structured state
-        performance_text = ""
-        if self.state.performance_result:
-            pr = self.state.performance_result
-            performance_text = (
-                # BUG FIX: values are stored as plain percentages (e.g. 18.61 means 18.61%).
-                # Using :.1% would multiply by 100 again → "1861.0%". Use :.2f% instead.
-                f"Revenue CAGR: {pr.get('revenue', {}).get('cagr', 0):.2f}% | "
-                f"EBITDA Margin: {pr.get('profitability', {}).get('current_ebitda_margin', 0):.2f}% | "
-                f"Positives: {', '.join(pr.get('top_3_positives', [])[:3])} | "
-                f"Concerns: {', '.join(pr.get('top_3_concerns', [])[:3])}"
-            )
-
-        market_text = ""
-        if self.state.market_result:
-            mr = self.state.market_result
-            market_text = (
-                f"Sector: {mr.get('sector', '')} | "
-                f"Competitive position: {mr.get('competitive_position_summary', '')} | "
-                f"Trends: {', '.join(mr.get('market_trends', [])[:3])}"
-            )
-
-        scenario_text = ""
-        if self.state.scenario_result:
-            sr = self.state.scenario_result
-            scenarios = sr.get('scenarios', [])
-            scenario_lines = []
-            for s in scenarios:
-                scenario_lines.append(
-                    f"{s.get('scenario_name')}: Y1=${s.get('year_1_revenue', 0):,.0f}M "
-                    # BUG FIX: growth_rate is a plain percentage (e.g. 8.79).
-                    # :.1% would display it as 879.0%. Use :.2f% instead.
-                    f"({s.get('growth_rate', 0):.2f}% growth)"
-                )
-            scenario_text = " | ".join(scenario_lines)
-
-        risk_text = ""
-        if self.state.risk_result:
-            rr = self.state.risk_result
-            risk_text = (
-                f"Overall Risk: {rr.get('overall_risk_level', 'unknown').upper()} | "
-                f"Flags: {', '.join(rr.get('risk_flags', [])[:3])} | "
-                f"Mitigations: {', '.join(rr.get('mitigation_recommendations', [])[:3])}"
-            )
-
-        cfo_text = ""
-        if self.state.cfo_result:
-            cr = self.state.cfo_result
-            cfo_text = cr.get('executive_summary', '')
-
-        # Generate PDF
-        # NOTE: Import build_pdf_report (plain Python function), NOT generate_pdf_report.
-        # generate_pdf_report is decorated with @tool which turns it into a CrewAI Tool
-        # *object* — calling it as a function raises "Tool object is not callable".
-        # build_pdf_report is the identical logic without the decorator, safe to call directly.
         try:
             from fpa_tools.pdf_generator import build_pdf_report as _gen_pdf
-            pdf_output_path = f"reports/{self.state.company_name}_analysis.pdf"
+            pdf_output_path = f"reports/{company}_analysis.pdf"
+
+            report_text = self.state.llm_report or ""
+            perf = self.state.performance_result or {}
+            rev  = perf.get("revenue", {})
+            prof = perf.get("profitability", {})
+            cf   = perf.get("cash_flow", {})
+            raw_analysis = self.state.direct_analysis_result or ""
+
+            # ── Performance section: metrics block + full raw analysis ────────
+            if perf:
+                ccr = cf.get("cash_conversion_ratio")
+                metrics_block = (
+                    f"Revenue CAGR: {rev.get('cagr', 0):.2f}%  |  "
+                    f"YoY Growth (latest): {rev.get('yoy_growth', 0):.2f}%  |  "
+                    f"Revenue Trend: {rev.get('trend', 'N/A')}\n"
+                    f"EBITDA Margin: {prof.get('current_ebitda_margin', 0):.1f}%  |  "
+                    f"Margin Trend: {prof.get('margin_trend', 'N/A')}\n"
+                    f"Operating Cash Flow: ${cf.get('operating_cash_flow', 0):,.0f}M  |  "
+                    f"Cash Conversion Ratio: {f'{ccr:.3f}' if ccr else 'N/A'}\n"
+                    f"Risk Level: {perf.get('risk_level', 'unknown').upper()}"
+                )
+                performance_text = metrics_block
+                if raw_analysis:
+                    performance_text += f"\n\nDetailed Analysis Data:\n{raw_analysis}"
+            else:
+                performance_text = raw_analysis or "No performance data available."
+
+            # ── Parse the LLM report into named sections ──────────────────────
+            sections = self._parse_llm_report_sections(report_text)
+
+            # Append LLM commentary on metrics (sections 1–5) to performance
+            yoy_key = next((k for k in sections if k.startswith("YoY Growth")), "")
+            perf_llm = "\n\n".join(filter(None, [
+                sections.get("Revenue CAGR", ""),
+                sections.get(yoy_key, "") if yoy_key else "",
+                sections.get("EBITDA Margin", ""),
+                sections.get("Operating Cash Flow", ""),
+                sections.get("Cash Conversion Ratio", ""),
+            ]))
+            if perf_llm:
+                performance_text += f"\n\nAI Narrative:\n{perf_llm}"
+
+            # Market section → Top 3 Positives + Concerns (LLM sections 6–7)
+            market_text = "\n\n".join(filter(None, [
+                sections.get("Top 3 Positives", ""),
+                sections.get("Top 3 Concerns", ""),
+            ]))
+            if not market_text:
+                top_pos = "\n".join(f"- {p}" for p in perf.get("top_3_positives", []))
+                top_con = "\n".join(f"- {c}" for c in perf.get("top_3_concerns", []))
+                market_text = (
+                    (f"Strengths:\n{top_pos}\n\n" if top_pos else "") +
+                    (f"Concerns:\n{top_con}" if top_con else "")
+                ) or "See performance analysis section."
+
+            # Scenario section → section 9 from LLM prompt
+            scenario_text = (
+                sections.get("Scenario Projections", "")
+                or sections.get("Scenario", "")
+                or sections.get("Scenarios", "")
+                or sections.get("Revenue Scenarios", "")
+                or sections.get("Forward-Looking Scenarios", "")
+            )
+
+            # Risk section → risk level + flags + LLM risk commentary
+            risk_llm = (
+                sections.get("Risk Level Assessment", "")
+                or sections.get("Risk Level", "")
+                or sections.get("Risk", "")
+            )
+            risk_flags_str = "; ".join(perf.get("risk_flags", [])[:3]) if perf else ""
+            risk_parts = []
+            if perf:
+                risk_parts.append(
+                    f"Overall Risk: {perf.get('risk_level', 'unknown').upper()} | "
+                    f"Risk Flags: {risk_flags_str or 'None'}"
+                )
+            if risk_llm:
+                risk_parts.append(risk_llm)
+            risk_text = "\n\n".join(risk_parts) or "Risk data not available."
+
+            # CFO / Executive summary → section 10 (Strategic Recommendations)
+            cfo_text = (
+                sections.get("Strategic Recommendations", "")
+                or sections.get("Recommendations", "")
+                or sections.get("Strategic Recommendation", "")
+            )
+            if not cfo_text:
+                # Parsing failed — use the full LLM report (no char cap)
+                cfo_text = report_text
+
             _gen_pdf(
                 performance_insights=performance_text,
                 market_insights=market_text,
@@ -602,29 +699,39 @@ class FinancialAnalysisFlow(Flow[FPAFlowState]):
             fpa_logger.error(f"[Flow] PDF generation failed: {str(e)}")
             self.state.error_message = f"PDF generation failed: {str(e)}"
 
-        # Track generated charts
-        import os
-        chart_files = [
-            'charts/revenue_trend.png',
-            'charts/profitability_analysis.png',
-            'charts/scenario_comparison.png',
-            'charts/risk_dashboard.png',
-            'charts/waterfall_revenue.png',
-            'charts/radar_metrics.png',
-        ]
-        self.state.charts_generated = [f for f in chart_files if os.path.exists(f)]
+    def _parse_llm_report_sections(self, report_text: str) -> Dict[str, str]:
+        """
+        Parse the numbered LLM report into a dict of section_name -> content.
 
-        return self.state
+        Handles multiple LLM formatting styles:
+          ## 1. Revenue CAGR\\n<content>
+          **1. Revenue CAGR**\\n<content>
+          1. Revenue CAGR\\n<content>
+        """
+        if not report_text:
+            return {}
 
-    # ── Step 5: Deliver Results ────────────────────────────────────────────────
+        sections: Dict[str, str] = {}
 
-    @listen(generate_reports)
-    def deliver_results(self):
-        """Final step — mark pipeline complete and return final state."""
-        self.state.current_step = "completed"
-        log_flow_state("deliver_results", f"pdf={self.state.pdf_path}, charts={len(self.state.charts_generated)}")
-        fpa_logger.info(
-            f"[Flow] ✅ Analysis complete for {self.state.company_name}. "
-            f"PDF: {self.state.pdf_path}"
+        # Regex: captures the number and title from numbered section headers
+        pattern = re.compile(
+            r'(?:^#{1,3}\s*|\*{1,2})?(\d+)\.\s+([^\n*#\r]+?)(?:\*{1,2})?\s*[\r\n]',
+            re.MULTILINE
         )
-        return self.state
+
+        matches = list(pattern.finditer(report_text))
+        if not matches:
+            sections["full_report"] = report_text
+            return sections
+
+        for i, match in enumerate(matches):
+            section_name = match.group(2).strip().rstrip(":")
+            start = match.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(report_text)
+            content = report_text[start:end].strip()
+            sections[section_name] = content
+
+        fpa_logger.info(
+            f"[Flow] Parsed {len(sections)} LLM report sections: {list(sections.keys())}"
+        )
+        return sections

@@ -1,7 +1,7 @@
 """
-Financial FP&A Analysis — Streamlit Application v2.
-Powered by CrewAI Flows with typed state, real-time progress,
-and structured Pydantic outputs.
+Financial FP&A Analysis — Streamlit Application v3.
+Powered by a 2-stage pipeline: direct tool execution (Stage 1)
++ single LLM report generation (Stage 2). No ReAct agent loop.
 """
 
 import streamlit as st
@@ -19,8 +19,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from dotenv import load_dotenv
 load_dotenv()
 
-if not os.getenv('GEMINI_API_KEY') and os.getenv('OPENAI_API_KEY'):
-    os.environ['GEMINI_API_KEY'] = os.getenv('OPENAI_API_KEY')
+if not os.getenv('GROQ_API_KEY') and os.getenv('OPENAI_API_KEY'):
+    os.environ['GROQ_API_KEY'] = os.getenv('OPENAI_API_KEY')
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -120,46 +120,38 @@ for k, v in defaults.items():
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-header">📊 Financial FP&A Intelligence</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Enterprise-Grade AI Financial Analysis · Powered by CrewAI Flows</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Enterprise-Grade AI Financial Analysis · 2-Stage Pipeline · Max 1 LLM Call</div>', unsafe_allow_html=True)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
 
     # LLM Status
-    gemini_key = os.getenv('GEMINI_API_KEY', '')
+    groq_key = os.getenv('GROQ_API_KEY', '')
 
-    if gemini_key:
-        st.success(f"✅ Gemini · `gemini-2.5-flash-lite`")
+    if groq_key:
+        st.success(f"✅ Groq · `meta-llama/llama-4-scout-17b-16e-instruct`")
     else:
         st.error("❌ LLM not configured")
 
     st.markdown("---")
-    st.markdown("### 📋 Pipeline Steps")
+    st.markdown("### 📋 Pipeline Stages")
     pipeline_steps = [
-        "1. Input Validation (Flow)",
-        "2. Performance Analysis",
-        "3. Market Research",
-        "4. Scenario Planning",
-        "5. Risk Assessment",
-        "6. Chart Generation",
-        "7. CFO Advisory",
-        "8. PDF Report Generation",
+        "**Stage 1 — No LLM**",
+        "1. Input Validation",
+        "2. FP&A Analysis (Python)",
+        "3. Chart Generation (6 charts)",
+        "**Stage 2 — 1 LLM Call**",
+        "4. Report Generation",
+        "5. PDF Export",
     ]
     for step in pipeline_steps:
         st.markdown(f"<small>{step}</small>", unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown("### 🤖 AI Agents")
-    agents = [
-        "🔍 FP&A Analyst",
-        "🌍 Market Researcher",
-        "📈 Scenario Analyst",
-        "⚠️ Risk Analyst",
-        "💼 CFO Advisor",
-    ]
-    for a in agents:
-        st.markdown(f"<small>{a}</small>", unsafe_allow_html=True)
+    st.markdown("### ⚡ LLM Usage")
+    st.markdown("<small>Max **1 API call** per run</small>", unsafe_allow_html=True)
+    st.markdown("<small>Fallback: deterministic report if LLM unavailable</small>", unsafe_allow_html=True)
 
     st.markdown("---")
     # Quick run with default dataset
@@ -307,6 +299,7 @@ with tab1:
             os.makedirs("charts",  exist_ok=True)
             os.makedirs("reports", exist_ok=True)
             os.makedirs("logs",    exist_ok=True)
+            os.makedirs("cache",   exist_ok=True)
 
             try:
                 from financial_fpa.flow import FinancialAnalysisFlow
@@ -338,13 +331,16 @@ with tab1:
                         "company":   st.session_state.selected_company,
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "pdf_path":  final.pdf_path,
+                        "api_calls": getattr(final, 'api_calls_made', 0),
+                        "rate_limits": getattr(final, 'rate_limit_hits', 0),
                     })
                 else:
                     status_ph.warning(
                         f"⚠️ Analysis ended at step: {step}. "
                         f"{final.error_message or ''}"
                     )
-                    if final.performance_result or final.cfo_result:
+                    # Accept partial results if we have at least the analysis text or report
+                    if final.direct_analysis_result or final.llm_report:
                         st.session_state.analysis_complete = True
                         st.session_state.flow_state        = final
 
@@ -380,20 +376,56 @@ with tab2:
         company = state.company_name
 
         # Status banner
-        risk_level = "unknown"
-        if state.risk_result:
-            risk_level = state.risk_result.get('overall_risk_level', 'unknown')
+        perf = state.performance_result or {}
+        risk_level = perf.get('risk_level', 'unknown')
+        report_source = getattr(state, 'llm_report_source', 'unknown')
 
         banner_col1, banner_col2, banner_col3 = st.columns(3)
         with banner_col1:
             st.metric("Company", company)
         with banner_col2:
-            st.metric("Analysis Status", state.current_step.replace("_", " ").title())
+            source_label = {"llm": "✅ LLM Report", "fallback": "⚡ Auto Report", "none": "⚠️ No Report"}.get(report_source, report_source)
+            st.metric("Report Source", source_label)
         with banner_col3:
             risk_color = {
                 'low': '🟢', 'moderate': '🟡', 'high': '🔴', 'critical': '💀'
             }.get(risk_level, '⚪')
             st.metric("Risk Level", f"{risk_color} {risk_level.upper()}")
+
+        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+
+        # Key metrics summary
+        st.subheader("⚡ Key Metrics Summary")
+
+        if perf:
+            rev  = perf.get('revenue', {})
+            prof = perf.get('profitability', {})
+            cf   = perf.get('cash_flow', {})
+
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                cagr = rev.get('cagr', 0)
+                st.metric("Revenue CAGR", f"{cagr:.1f}%" if cagr else "N/A")
+            with m2:
+                yoy = rev.get('yoy_growth', 0)
+                st.metric("Latest YoY Growth", f"{yoy:.1f}%" if yoy is not None else "N/A",
+                          delta=f"{yoy:.1f}%" if yoy else None)
+            with m3:
+                margin = prof.get('current_ebitda_margin', 0)
+                st.metric("EBITDA Margin", f"{margin:.1f}%" if margin else "N/A")
+            with m4:
+                ocf = cf.get('operating_cash_flow', 0)
+                st.metric("Operating CF", f"${ocf:,.0f}M" if ocf else "N/A")
+
+            pos_col, neg_col = st.columns(2)
+            with pos_col:
+                st.markdown("**✅ Top Strengths**")
+                for p in perf.get('top_3_positives', []):
+                    st.markdown(f"- {p}")
+            with neg_col:
+                st.markdown("**⚠️ Top Concerns**")
+                for c in perf.get('top_3_concerns', []):
+                    st.markdown(f"- {c}")
 
         st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
 
@@ -411,7 +443,6 @@ with tab2:
         existing = {k: v for k, v in chart_map.items() if os.path.exists(v)}
         if existing:
             chart_items = list(existing.items())
-            # Display 2 per row
             for i in range(0, len(chart_items), 2):
                 cols = st.columns(2)
                 for j, col in enumerate(cols):
@@ -422,42 +453,6 @@ with tab2:
                             st.image(path, use_column_width=True)
         else:
             st.warning("Charts not found — they may still be generating.")
-
-        # Key metrics summary
-        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
-        st.subheader("⚡ Key Metrics Summary")
-
-        if state.performance_result:
-            pr = state.performance_result
-            rev = pr.get('revenue', {})
-            prof = pr.get('profitability', {})
-            cf   = pr.get('cash_flow', {})
-
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                cagr = rev.get('cagr', 0)
-                st.metric("Revenue CAGR", f"{cagr:.1f}%" if cagr else "N/A")
-            with m2:
-                yoy = rev.get('yoy_growth', 0)
-                st.metric("Latest YoY Growth", f"{yoy:.1f}%" if yoy is not None else "N/A",
-                          delta=f"{yoy:.1f}%" if yoy else None)
-            with m3:
-                margin = prof.get('current_ebitda_margin', 0)
-                st.metric("EBITDA Margin", f"{margin:.1f}%" if margin else "N/A")
-            with m4:
-                ocf = cf.get('operating_cash_flow', 0)
-                st.metric("Operating CF", f"${ocf:,.0f}M" if ocf else "N/A")
-
-            # Positives & Concerns
-            pos_col, neg_col = st.columns(2)
-            with pos_col:
-                st.markdown("**✅ Top Strengths**")
-                for p in pr.get('top_3_positives', []):
-                    st.markdown(f"- {p}")
-            with neg_col:
-                st.markdown("**⚠️ Top Concerns**")
-                for c in pr.get('top_3_concerns', []):
-                    st.markdown(f"- {c}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — Detailed Analysis
@@ -470,117 +465,45 @@ with tab3:
     else:
         state = st.session_state.flow_state
 
-        # CFO Executive Summary
-        if state.cfo_result:
-            cfr = state.cfo_result
-            st.subheader("💼 CFO Executive Summary")
-            st.markdown(
-                f"> {cfr.get('executive_summary', 'Not available')}"
-            )
+        # LLM Report
+        if state.llm_report:
+            report_source = getattr(state, 'llm_report_source', 'unknown')
+            source_badge = {
+                "llm":      "🤖 AI-Generated Report",
+                "fallback": "⚡ Auto-Generated Report (LLM unavailable)",
+            }.get(report_source, "📋 Report")
+            st.subheader(f"📄 {source_badge}")
+            st.markdown(state.llm_report)
             st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
 
-            # Recommendations table
-            recs = cfr.get('recommendations', [])
-            if recs:
-                st.markdown("**Strategic Recommendations**")
-                rec_data = []
-                for r in recs:
-                    priority_icon = {
-                        'immediate':    '🔴',
-                        'short-term':   '🟡',
-                        'medium-term':  '🟢',
-                    }.get(r.get('priority', ''), '⚪')
-                    rec_data.append({
-                        "Priority":        f"{priority_icon} {r.get('priority', '').title()}",
-                        "Recommendation":  r.get('title', ''),
-                        "Rationale":       r.get('rationale', ''),
-                        "Expected Impact": r.get('expected_impact', ''),
-                    })
-                st.dataframe(pd.DataFrame(rec_data), use_container_width=True)
+        # Structured performance metrics from Stage 1
+        perf = state.performance_result or {}
+        if perf:
+            st.subheader("📊 Structured Metrics (Computed)")
+            rev  = perf.get('revenue', {})
+            prof = perf.get('profitability', {})
+            cf   = perf.get('cash_flow', {})
 
-        # Scenario Planning
-        if state.scenario_result:
-            sr = state.scenario_result
-            st.subheader("📈 Scenario Projections")
-            scenarios = sr.get('scenarios', [])
-            if scenarios:
-                sc_rows = []
-                for s in scenarios:
-                    sc_rows.append({
-                        "Scenario":    s.get('scenario_name', ''),
-                        "Growth Rate": f"{s.get('growth_rate', 0):.1f}%",
-                        "Probability": f"{s.get('probability_weight', 0):.0%}",
-                        "Year 1 ($M)": f"${s.get('year_1_revenue', 0):,.0f}",
-                        "Year 2 ($M)": f"${s.get('year_2_revenue', 0):,.0f}",
-                        "Year 3 ($M)": f"${s.get('year_3_revenue', 0):,.0f}",
-                    })
-                st.dataframe(pd.DataFrame(sc_rows), use_container_width=True)
+            metrics_data = [
+                {"Metric": "Revenue CAGR",        "Value": f"{rev.get('cagr', 0):.2f}%",              "Trend": rev.get('trend', 'N/A')},
+                {"Metric": "Latest YoY Growth",   "Value": f"{rev.get('yoy_growth', 0):.2f}%",        "Trend": ""},
+                {"Metric": "Current Revenue",      "Value": f"${rev.get('current_revenue', 0):,.0f}M",  "Trend": ""},
+                {"Metric": "EBITDA Margin",        "Value": f"{prof.get('current_ebitda_margin', 0):.1f}%", "Trend": prof.get('margin_trend', 'N/A')},
+                {"Metric": "Operating Cash Flow",  "Value": f"${cf.get('operating_cash_flow', 0):,.0f}M", "Trend": ""},
+                {"Metric": "Cash Conv. Ratio",     "Value": f"{cf.get('cash_conversion_ratio', 0):.3f}" if cf.get('cash_conversion_ratio') else "N/A", "Trend": ""},
+                {"Metric": "Risk Level",           "Value": perf.get('risk_level', 'unknown').upper(),  "Trend": ""},
+            ]
+            st.dataframe(pd.DataFrame(metrics_data), use_container_width=True)
 
-            drivers = sr.get('sensitivity_drivers', [])
-            if drivers:
-                st.markdown("**Key Sensitivity Drivers:**")
-                for d in drivers:
-                    st.markdown(f"- {d}")
-
-        # Risk Assessment
-        if state.risk_result:
-            rr = state.risk_result
-            st.subheader("⚠️ Risk Assessment")
-
-            risk_level = rr.get('overall_risk_level', 'unknown')
-            risk_class = f"risk-{risk_level}"
-            st.markdown(
-                f'Overall Risk Level: <span class="{risk_class}">'
-                f'{risk_level.upper()}</span>',
-                unsafe_allow_html=True
-            )
-            metrics = rr.get('metrics', [])
-            if metrics:
-                m_rows = []
-                for m in metrics:
-                    m_rows.append({
-                        "Metric":         m.get('metric_name', ''),
-                        "Value":          f"{m.get('current_value', 0):.2f}",
-                        "Threshold":      f"{m.get('threshold', 0):.2f}",
-                        "Status":         m.get('status', '').upper(),
-                        "Interpretation": m.get('interpretation', ''),
-                    })
-                st.dataframe(pd.DataFrame(m_rows), use_container_width=True)
-
-            flags = rr.get('risk_flags', [])
-            if flags:
-                st.markdown("**🚩 Active Risk Flags:**")
-                for flag in flags:
+            if perf.get('risk_flags'):
+                st.markdown("**🚩 Risk Flags:**")
+                for flag in perf.get('risk_flags', []):
                     st.warning(flag)
 
-        # Market Benchmarks
-        if state.market_result:
-            mr = state.market_result
-            st.subheader("🌍 Market Benchmark Comparison")
-            benchmarks = mr.get('benchmarks', [])
-            if benchmarks:
-                b_rows = []
-                for b in benchmarks:
-                    b_rows.append({
-                        "Metric":          b.get('metric_name', ''),
-                        "Company Value":   f"{b.get('company_value', 0):.2%}" if abs(b.get('company_value', 0)) < 10 else f"{b.get('company_value', 0):.2f}",
-                        "Industry Median": f"{b.get('industry_median', 0):.2%}" if abs(b.get('industry_median', 0)) < 10 else f"{b.get('industry_median', 0):.2f}",
-                        "Assessment":      b.get('assessment', '').title(),
-                    })
-                st.dataframe(pd.DataFrame(b_rows), use_container_width=True)
-
-            st.markdown(f"**Competitive Position:** {mr.get('competitive_position_summary', '')}")
-
-        # Raw JSON toggle
-        with st.expander("🔍 Raw Structured Output (JSON)"):
-            raw_state = {
-                "performance": state.performance_result,
-                "scenario":    state.scenario_result,
-                "risk":        state.risk_result,
-                "market":      state.market_result,
-                "cfo":         state.cfo_result,
-            }
-            st.json({k: v for k, v in raw_state.items() if v is not None})
+        # Raw analysis text (expandable)
+        if state.direct_analysis_result:
+            with st.expander("🔍 Raw FP&A Metrics (Stage 1 Output)"):
+                st.code(state.direct_analysis_result, language="text")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — Download Report
@@ -648,14 +571,15 @@ with tab4:
         st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
         st.markdown("### 📋 Structured Data Export")
         structured_data = {
-            "company":     state.company_name,
-            "sector":      state.sector,
-            "timestamp":   datetime.now().isoformat(),
-            "performance": state.performance_result,
-            "scenarios":   state.scenario_result,
-            "risk":        state.risk_result,
-            "market":      state.market_result,
-            "cfo":         state.cfo_result,
+            "company":            state.company_name,
+            "sector":             state.sector,
+            "timestamp":          datetime.now().isoformat(),
+            "report_source":      getattr(state, 'llm_report_source', 'unknown'),
+            "performance":        state.performance_result,
+            "llm_report":         state.llm_report,
+            "direct_analysis":    state.direct_analysis_result,
+            "api_calls_made":     getattr(state, 'api_calls_made', 0),
+            "rate_limit_hits":    getattr(state, 'rate_limit_hits', 0),
         }
         json_str = json.dumps(
             {k: v for k, v in structured_data.items() if v is not None},
@@ -680,9 +604,8 @@ with tab4:
 st.markdown("---")
 st.markdown(
     "<div style='text-align:center;color:#555;padding:0.5rem;font-size:0.85rem;'>"
-    "<strong>Financial FP&A Intelligence v2</strong> · "
-    "Powered by CrewAI Flows · "
-    "Structured Outputs · Knowledge Sources · Memory"
+    "<strong>Financial FP&A Intelligence v3</strong> · "
+    "2-Stage Pipeline · Max 1 LLM Call · Deterministic Fallback"
     "</div>",
     unsafe_allow_html=True
 )
@@ -691,3 +614,4 @@ if __name__ == "__main__":
     os.makedirs("charts",  exist_ok=True)
     os.makedirs("reports", exist_ok=True)
     os.makedirs("logs",    exist_ok=True)
+    os.makedirs("cache",   exist_ok=True)

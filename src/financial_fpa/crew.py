@@ -1,28 +1,27 @@
 """
-Financial FP&A Crew — Production Architecture v2.
+Financial FP&A Crew — Production Architecture v4 (2-Stage Pipeline).
 
-Features implemented:
-  Phase 1: output_pydantic on all 5 analysis tasks (structured output)
-  Phase 2: Knowledge Sources — JSONKnowledgeSource + TextFileKnowledgeSource
-  Phase 3: memory=False (Groq has no embeddings API; disabled to avoid conflicts)
-  Phase 5: Process.sequential with guardrails on performance + CFO tasks
-  Phase 6: Task callbacks for progress tracking
+ARCHITECTURE CHANGE from v3:
+  - FinancialFpa crew class REMOVED (entire ReAct agent loop eliminated)
+  - run_tools_directly() KEPT — Stage 1 of the new 2-stage pipeline
+  - FPAAnalysisCache KEPT — disk cache prevents redundant analysis runs
+  - APICallTracker KEPT — lightweight call counter for monitoring
+  - validate_tool_args() KEPT — used inside run_tools_directly()
+
+The LLM is now called ONCE in flow.py (generate_llm_report step),
+NOT via CrewAI agents. This eliminates:
+  - Empty/None LLM responses caused by ReAct tool-call loops
+  - Redundant tool calls (tools were being called by both run_direct_tools
+    AND again by the crew agents)
+  - Over-constrained prompts (Thought/Action/Observation format)
+  - Unnecessary agent retries consuming API quota
 """
 
 import os
-import re
-from typing import Tuple, Any
-
-from crewai import Agent, Crew, LLM, Process, Task
-from crewai.project import CrewBase, agent, crew, task
-
-# Knowledge sources
-try:
-    from crewai.knowledge.source.json_knowledge_source import JSONKnowledgeSource
-    from crewai.knowledge.source.text_file_knowledge_source import TextFileKnowledgeSource
-    KNOWLEDGE_AVAILABLE = True
-except ImportError:
-    KNOWLEDGE_AVAILABLE = False
+import json
+import time as _time
+import hashlib
+from typing import Tuple, Any, Dict, Optional
 
 from crewai.tools import tool
 
@@ -36,329 +35,260 @@ from fpa_tools.chart_tools import (
     generate_radar_chart,
     generate_metrics_heatmap,
 )
-from fpa_tools.pdf_generator import generate_pdf_report
 
-from financial_fpa.models import (
-    PerformanceAnalysisOutput,
-    ScenarioPlanningOutput,
-    RiskAssessmentOutput,
-    MarketResearchOutput,
-    CFOAdvisoryOutput,
-)
+from fpa_tools.logger import fpa_logger
 
 
-# ── LLM — GEMINI Model Setup ───
-# gemini-2.0-flash: 1,500 req/day free (vs. 20/day for gemini-2.5-flash-lite)
-# This is the most cost-effective free-tier model for multi-agent pipelines.
-_gemini_llm = LLM(
-    model="gemini/gemini-2.0-flash",
-    api_key=os.environ.get("GEMINI_API_KEY", ""),
-    temperature=0.1,
-)
+# ══════════════════════════════════════════════════════════════════════════════
+# CACHING LAYER
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-# ── Knowledge Sources (Phase 2) ─────────────────────────────────────────────
-def _build_knowledge_sources():
-    """Build knowledge source instances if the library supports them."""
-    if not KNOWLEDGE_AVAILABLE:
-        return None, None
-    try:
-        benchmarks_knowledge = JSONKnowledgeSource(
-            file_paths=["knowledge/industry_benchmarks.json"]
-        )
-        fpa_knowledge = TextFileKnowledgeSource(
-            file_paths=["knowledge/fpa_frameworks.txt"]
-        )
-        return benchmarks_knowledge, fpa_knowledge
-    except Exception:
-        return None, None
-
-
-benchmarks_knowledge, fpa_knowledge = _build_knowledge_sources()
-
-
-# ── FPA Analysis Tool (wraps per-company engine) ──────────────────────────────
-@tool
-def fpa_analysis_tool(csv_path: str, company: str = "", sector: str = ""):
+class FPAAnalysisCache:
     """
-    Run comprehensive FP&A analysis for a specific company.
+    Disk-backed JSON cache for fpa_analysis_tool results.
 
-    Args:
-        csv_path: Path to the CSV file containing financial data
-        company: Company name/ticker to analyze (required for accurate results)
-        sector: Industry sector for risk context (e.g. 'IT', 'FinTech', 'Bank')
+    Cache key = hash(company + csv_path + csv_mtime).
+    Same company + same file → returns cached result, skips computation.
+    """
+
+    CACHE_DIR = "cache"
+    CACHE_FILE = os.path.join(CACHE_DIR, "fpa_analysis_cache.json")
+
+    @classmethod
+    def _ensure_dir(cls):
+        os.makedirs(cls.CACHE_DIR, exist_ok=True)
+
+    @classmethod
+    def _cache_key(cls, company: str, csv_path: str) -> str:
+        try:
+            mtime = str(os.path.getmtime(csv_path))
+        except OSError:
+            mtime = "unknown"
+        raw = f"{company.strip().upper()}|{os.path.abspath(csv_path)}|{mtime}"
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    @classmethod
+    def get(cls, company: str, csv_path: str) -> Optional[str]:
+        """Return cached analysis result or None."""
+        cls._ensure_dir()
+        key = cls._cache_key(company, csv_path)
+        try:
+            if os.path.exists(cls.CACHE_FILE):
+                with open(cls.CACHE_FILE, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+                if key in cache:
+                    fpa_logger.info(f"[Cache] HIT for {company} (key={key[:8]}…)")
+                    return cache[key]
+        except (json.JSONDecodeError, OSError) as e:
+            fpa_logger.warning(f"[Cache] Read error: {e}")
+        return None
+
+    @classmethod
+    def put(cls, company: str, csv_path: str, result: str) -> None:
+        """Store analysis result in cache."""
+        cls._ensure_dir()
+        key = cls._cache_key(company, csv_path)
+        try:
+            cache = {}
+            if os.path.exists(cls.CACHE_FILE):
+                with open(cls.CACHE_FILE, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+            cache[key] = result
+            with open(cls.CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=2)
+            fpa_logger.info(f"[Cache] STORED for {company} (key={key[:8]}…)")
+        except (json.JSONDecodeError, OSError) as e:
+            fpa_logger.warning(f"[Cache] Write error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# API CALL TRACKER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class APICallTracker:
+    """Lightweight call counter for monitoring LLM usage per run."""
+
+    def __init__(self, max_calls: int = 5):
+        self.max_calls = max_calls
+        self.call_count = 0
+        self.rate_limit_hits = 0
+        self.skipped_steps = []
+
+    def can_call(self) -> bool:
+        return self.call_count < self.max_calls
+
+    def record_call(self, description: str = ""):
+        self.call_count += 1
+        fpa_logger.info(
+            f"[APITracker] Call #{self.call_count}/{self.max_calls}: {description}"
+        )
+
+    def record_rate_limit(self, description: str = ""):
+        self.rate_limit_hits += 1
+        fpa_logger.warning(
+            f"[APITracker] Rate limit hit #{self.rate_limit_hits}: {description}"
+        )
+
+    def record_skip(self, step: str, reason: str = ""):
+        self.skipped_steps.append(step)
+        fpa_logger.warning(f"[APITracker] SKIPPED '{step}': {reason}")
+
+    def summary(self) -> str:
+        return (
+            f"[APITracker] Run summary: "
+            f"calls={self.call_count}/{self.max_calls}, "
+            f"rate_limits={self.rate_limit_hits}, "
+            f"skipped={self.skipped_steps}"
+        )
+
+
+# Module-level tracker — reset per flow run
+api_tracker = APICallTracker(max_calls=5)
+
+
+def reset_api_tracker() -> APICallTracker:
+    """Reset the global API tracker for a new run."""
+    global api_tracker
+    api_tracker = APICallTracker(max_calls=5)
+    return api_tracker
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL ARGUMENT VALIDATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def validate_tool_args(
+    tool_name: str,
+    args: Dict[str, Any],
+    company: str = "",
+) -> Dict[str, Any]:
+    """
+    Validate and auto-fill required arguments before calling any chart tool.
+
+    - output_path: auto-filled with sensible default if missing
+    - company: auto-filled from context if missing
+    - csv_path: raises if missing or not found
+    """
+    validated = dict(args)
+
+    chart_defaults = {
+        "generate_revenue_trend_chart":         "charts/revenue_trend.png",
+        "generate_profitability_analysis_chart": "charts/profitability_analysis.png",
+        "generate_scenario_comparison_chart":    "charts/scenario_comparison.png",
+        "generate_risk_dashboard":               "charts/risk_dashboard.png",
+        "generate_waterfall_chart":              "charts/waterfall_revenue.png",
+        "generate_radar_chart":                  "charts/radar_metrics.png",
+        "generate_metrics_heatmap":              "charts/metrics_heatmap.png",
+    }
+
+    if tool_name in chart_defaults:
+        if "output_path" not in validated or not validated["output_path"]:
+            validated["output_path"] = chart_defaults[tool_name]
+            fpa_logger.info(
+                f"[Validation] Auto-filled output_path for {tool_name}: "
+                f"{validated['output_path']}"
+            )
+
+    if "company" not in validated or not validated["company"]:
+        if company:
+            validated["company"] = company
+
+    if "csv_path" in validated:
+        csv = validated["csv_path"]
+        if not csv:
+            raise ValueError(f"[Validation] csv_path is empty for {tool_name}")
+        if not os.path.exists(csv):
+            raise FileNotFoundError(
+                f"[Validation] csv_path not found for {tool_name}: {csv}"
+            )
+
+    return validated
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 1: DIRECT TOOL EXECUTION (no LLM — pure Python computation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_tools_directly(csv_path: str, company: str, sector: str = "IT") -> Dict[str, Any]:
+    """
+    Stage 1 of the 2-stage pipeline.
+
+    Run FPA analysis + all 6 charts as direct Python calls — ZERO LLM usage.
+    These are pure computation: CSV → numbers + PNGs.
 
     Returns:
-        Compact financial metrics summary (token-efficient) including revenue CAGR,
-        EBITDA margins, cash flow, risk indicators, and scenario projections.
+        dict with keys:
+          - analysis_result: str  (compact metrics summary, ~120 tokens)
+          - charts:          list[str]  (paths to successfully generated PNGs)
+          - errors:          list[str]  (non-fatal errors encountered)
     """
-    return run_fpa_analysis(
-        csv_path=csv_path,
-        company=company if company else None,
-        sector=sector if sector else None,
+    results: Dict[str, Any] = {
+        "analysis_result": None,
+        "charts": [],
+        "errors": [],
+    }
+
+    os.makedirs("charts", exist_ok=True)
+
+    # ── 1. FPA Analysis (with caching) ─────────────────────────────────
+    fpa_logger.info(f"[DirectExec] Step 1/2: Running FPA analysis for {company}…")
+    try:
+        cached = FPAAnalysisCache.get(company, csv_path)
+        if cached:
+            results["analysis_result"] = cached
+        else:
+            analysis = run_fpa_analysis(csv_path=csv_path, company=company, sector=sector)
+            results["analysis_result"] = analysis
+            FPAAnalysisCache.put(company, csv_path, analysis)
+    except Exception as e:
+        err = f"FPA analysis failed: {e}"
+        fpa_logger.error(f"[DirectExec] {err}")
+        results["errors"].append(err)
+
+    # ── 2. Charts (all 6, best-effort) ─────────────────────────────────
+    fpa_logger.info(f"[DirectExec] Step 2/2: Generating charts for {company}…")
+
+    chart_calls = [
+        ("generate_revenue_trend_chart",         generate_revenue_trend_chart,
+         {"csv_path": csv_path, "company": company, "output_path": "charts/revenue_trend.png"}),
+        ("generate_profitability_analysis_chart", generate_profitability_analysis_chart,
+         {"csv_path": csv_path, "company": company, "output_path": "charts/profitability_analysis.png"}),
+        ("generate_scenario_comparison_chart",    generate_scenario_comparison_chart,
+         {"csv_path": csv_path, "company": company, "output_path": "charts/scenario_comparison.png"}),
+        ("generate_risk_dashboard",               generate_risk_dashboard,
+         {"csv_path": csv_path, "company": company, "output_path": "charts/risk_dashboard.png"}),
+        ("generate_waterfall_chart",              generate_waterfall_chart,
+         {"csv_path": csv_path, "company": company, "output_path": "charts/waterfall_revenue.png"}),
+        ("generate_radar_chart",                  generate_radar_chart,
+         {"csv_path": csv_path, "company": company, "output_path": "charts/radar_metrics.png"}),
+    ]
+
+    for tool_name, tool_fn, tool_args in chart_calls:
+        try:
+            validated = validate_tool_args(tool_name, tool_args, company)
+            result = tool_fn.run(**validated)
+            if isinstance(result, dict):
+                if result.get("status") == "success":
+                    results["charts"].append(result.get("chart_path", validated["output_path"]))
+                    fpa_logger.info(f"[DirectExec] ✓ {tool_name}")
+                else:
+                    msg = result.get("message", "unknown error")
+                    results["errors"].append(f"{tool_name}: {msg}")
+                    fpa_logger.warning(f"[DirectExec] ✗ {tool_name}: {msg}")
+            else:
+                # String result — still treat as success
+                results["charts"].append(validated.get("output_path", ""))
+                fpa_logger.info(f"[DirectExec] ✓ {tool_name}: done")
+        except Exception as e:
+            err = f"{tool_name} failed: {e}"
+            fpa_logger.warning(f"[DirectExec] {err}")
+            results["errors"].append(err)
+            # Continue — chart failures are non-fatal
+
+    fpa_logger.info(
+        f"[DirectExec] Complete: "
+        f"analysis={'✓' if results['analysis_result'] else '✗'}, "
+        f"charts={len(results['charts'])}, "
+        f"errors={len(results['errors'])}"
     )
-
-
-# ── Guardrail Functions (Phase 5) ────────────────────────────────────────────
-
-def validate_performance_output(output) -> Tuple[bool, Any]:
-    """
-    Guardrail: Ensure performance analysis contains real numbers,
-    references the correct company, and doesn't average across companies.
-    """
-    text = output.raw if hasattr(output, 'raw') else str(output)
-
-    # Must contain actual numbers
-    numbers = re.findall(r'\d+\.?\d*%?', text)
-    if len(numbers) < 5:
-        return (False, "Performance analysis must contain at least 5 specific numerical metrics.")
-
-    # Guard against cross-company averages
-    if "average across all companies" in text.lower():
-        return (False, "Do NOT average across companies. Analyze the specific company only.")
-
-    if "all companies" in text.lower() and "average" in text.lower():
-        return (False, "Analysis must be scoped to the selected company only, not averaged.")
-
-    return (True, "Output validated successfully")
-
-
-def validate_cfo_output(output) -> Tuple[bool, Any]:
-    """
-    Guardrail: CFO advisory must be concise and have the right number of recommendations.
-    """
-    text = output.raw if hasattr(output, 'raw') else str(output)
-
-    # Must mention recommendations
-    rec_count = len(re.findall(
-        r'(recommend|immediate|short-term|medium-term)', text, re.IGNORECASE
-    ))
-    if rec_count < 3:
-        return (
-            False,
-            "CFO advisory must include at least 3 strategic recommendations with clear priorities."
-        )
-
-    return (True, "CFO output validated successfully")
-
-
-# ── Task Callback (Phase 6) ────────────────────────────────────────────────────────
-
-import time as _time
-
-# Inter-task pacing: Gemini's quota is DAILY (not per-minute like Groq TPM).
-# A short 3s courtesy sleep is enough — long sleeps waste time without helping
-# the daily quota at all. The pipeline now runs ~3 minutes faster as a result.
-_INTER_TASK_SLEEP_SECS = 3
-
-def log_task_completion(task_output):
-    """Called after each task completes — logs structured output and pace-sleeps."""
-    from fpa_tools.logger import fpa_logger
-    agent_role = task_output.agent if hasattr(task_output, 'agent') else "Unknown"
-    desc = task_output.description[:60] if hasattr(task_output, 'description') else ""
-    fpa_logger.info(f"[Task Complete] {agent_role}: {desc}...")
-    if hasattr(task_output, 'pydantic') and task_output.pydantic:
-        fpa_logger.info(f"  → Structured output: {type(task_output.pydantic).__name__}")
-    # Brief courtesy pause — Gemini daily quota is not affected by sleep duration
-    fpa_logger.info(f"[Task Pacing] Brief {_INTER_TASK_SLEEP_SECS}s pause (Gemini daily quota model)...")
-    _time.sleep(_INTER_TASK_SLEEP_SECS)
-
-
-# ── Crew Definition ───────────────────────────────────────────────────────────
-
-@CrewBase
-class FinancialFpa():
-    """
-    FinancialFpa crew — Production Financial Analysis v2.
-
-    Crew configuration:
-    - Process: Sequential (reliable task ordering for LLM-based analysis)
-    - Memory: Disabled (Groq has no embeddings API — stateless per-session)
-    - Knowledge: JSON benchmarks + FPA frameworks text
-    - Guardrails: Performance analysis + CFO advisory validation
-    - Structured Output: Pydantic models on all 5 analysis tasks
-    """
-
-    agents_config = 'config/agents.yaml'
-    tasks_config  = 'config/tasks.yaml'
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # AGENTS
-    # ═══════════════════════════════════════════════════════════════════════
-
-    @agent
-    def fpa_analyst(self) -> Agent:
-        """FP&A Analyst — historical performance analysis with charts."""
-        agent_kwargs = dict(
-            config=self.agents_config['fpa_analyst'],
-            llm=_gemini_llm,
-            tools=[
-                fpa_analysis_tool,
-                generate_revenue_trend_chart,
-                generate_profitability_analysis_chart,
-                generate_waterfall_chart,
-                generate_radar_chart,
-                generate_metrics_heatmap,
-            ],
-            verbose=True,
-            max_iter=8,             # Was 3 — gives breathing room for tool calls
-            max_retry_limit=3,      # Keep low: each retry uses ~2500 tokens of 30K TPM
-            respect_context_window=True,
-        )
-        if fpa_knowledge is not None:
-            agent_kwargs['knowledge_sources'] = [fpa_knowledge]
-        return Agent(**agent_kwargs)
-
-    @agent
-    def scenario_analyst(self) -> Agent:
-        """Scenario Analyst — forward-looking percentile-based projections."""
-        return Agent(
-            config=self.agents_config['scenario_analyst'],
-            llm=_gemini_llm,
-            tools=[generate_scenario_comparison_chart],
-            verbose=True,
-            max_iter=8,             # Was 3
-            max_retry_limit=3,      # Keep low: each retry uses ~2500 tokens of 30K TPM
-            respect_context_window=True,
-        )
-
-    @agent
-    def risk_analyst(self) -> Agent:
-        """Risk Analyst — financial stability and risk assessment."""
-        return Agent(
-            config=self.agents_config['risk_analyst'],
-            llm=_gemini_llm,
-            tools=[generate_risk_dashboard],
-            verbose=True,
-            max_iter=8,             # Was 3
-            max_retry_limit=3,      # Keep low: each retry uses ~2500 tokens of 30K TPM
-            respect_context_window=True,
-        )
-
-    @agent
-    def market_researcher(self) -> Agent:
-        """Market Researcher — grounded benchmark comparisons via knowledge base."""
-        agent_kwargs = dict(
-            config=self.agents_config['market_researcher'],
-            llm=_gemini_llm,
-            tools=[],  # Uses knowledge sources instead of live search
-            verbose=True,
-            max_iter=8,             # Was 3
-            max_retry_limit=3,      # Keep low: each retry uses ~2500 tokens of 30K TPM
-            respect_context_window=True,
-        )
-        # Inject benchmark knowledge so it never hallucates
-        if benchmarks_knowledge is not None:
-            agent_kwargs['knowledge_sources'] = [benchmarks_knowledge]
-        return Agent(**agent_kwargs)
-
-    @agent
-    def cfo_advisor(self) -> Agent:
-        """CFO Advisor — executive synthesis and PDF report generation."""
-        return Agent(
-            config=self.agents_config['cfo_advisor'],
-            llm=_gemini_llm,
-            tools=[generate_pdf_report],
-            verbose=True,
-            max_iter=8,             # Was 3
-            max_retry_limit=3,      # Keep low: each retry uses ~2500 tokens of 30K TPM
-            respect_context_window=True,
-        )
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # TASKS
-    # ═══════════════════════════════════════════════════════════════════════
-
-    @task
-    def performance_analysis_task(self) -> Task:
-        """Analyze historical financial performance — returns PerformanceAnalysisOutput."""
-        return Task(
-            config=self.tasks_config['performance_analysis_task'],
-            output_pydantic=PerformanceAnalysisOutput,       # Phase 1
-            guardrail=validate_performance_output,           # Phase 5
-            guardrail_max_retries=2,                         # Increased from 1
-            callback=log_task_completion,                    # Phase 6
-        )
-
-    @task
-    def market_research_task(self) -> Task:
-        """Research industry benchmarks — returns MarketResearchOutput."""
-        return Task(
-            config=self.tasks_config['market_research_task'],
-            output_pydantic=MarketResearchOutput,            # Phase 1
-            callback=log_task_completion,                    # Phase 6
-        )
-
-    @task
-    def scenario_planning_task(self) -> Task:
-        """Create forward-looking scenarios — returns ScenarioPlanningOutput."""
-        return Task(
-            config=self.tasks_config['scenario_planning_task'],
-            output_pydantic=ScenarioPlanningOutput,          # Phase 1
-            callback=log_task_completion,                    # Phase 6
-        )
-
-    @task
-    def risk_assessment_task(self) -> Task:
-        """Assess financial risks — returns RiskAssessmentOutput."""
-        return Task(
-            config=self.tasks_config['risk_assessment_task'],
-            output_pydantic=RiskAssessmentOutput,            # Phase 1
-            callback=log_task_completion,                    # Phase 6
-        )
-
-    @task
-    def chart_generation_task(self) -> Task:
-        """Generate all visualizations."""
-        return Task(
-            config=self.tasks_config['chart_generation_task'],
-            callback=log_task_completion,                    # Phase 6
-        )
-
-    @task
-    def cfo_advisory_task(self) -> Task:
-        """Synthesize executive advisory — returns CFOAdvisoryOutput."""
-        return Task(
-            config=self.tasks_config['cfo_advisory_task'],
-            output_pydantic=CFOAdvisoryOutput,               # Phase 1
-            guardrail=validate_cfo_output,                   # Phase 5
-            guardrail_max_retries=2,                         # Increased from 1
-            callback=log_task_completion,                    # Phase 6
-        )
-
-
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # CREW
-    # ═══════════════════════════════════════════════════════════════════════
-
-    @crew
-    def crew(self) -> Crew:
-        """
-        Creates the FinancialFpa production crew.
-
-        Process: Sequential — ensures reliable task ordering.
-        Memory: Enabled — agents remember cross-session insights.
-        Knowledge: Industry benchmarks + FPA frameworks.
-
-        Task Order:
-        1. performance_analysis_task  (FPA Analyst)
-        2. market_research_task       (Market Researcher)
-        3. scenario_planning_task     (Scenario Analyst)
-        4. risk_assessment_task       (Risk Analyst)
-        5. chart_generation_task      (FPA Analyst)
-        6. cfo_advisory_task          (CFO Advisor)
-        """
-        crew_kwargs = dict(
-            agents=self.agents,
-            tasks=self.tasks,
-            process=Process.sequential,
-            verbose=True,
-        )
-
-        # Memory disabled: Groq has no embeddings API, and local embedder libraries
-        # (sentence-transformers/fastembed) have version conflicts in this environment.
-        # The full LLM pipeline runs fine without cross-session memory.
-        crew_kwargs['memory'] = False
-
-        return Crew(**crew_kwargs)
+    return results
